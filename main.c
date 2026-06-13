@@ -56,6 +56,7 @@
 
 #define CKPT_MAGIC  0x534C4D31u   /* "SLM1" */
 #define CKPT_PATH   "sentinel.bin"
+#define VERSION     "0.1.0"
 
 /* ------------------------------------------------------------------ */
 /*  Parameters (static weight matrices) + Adagrad memory + gradients.  */
@@ -742,7 +743,60 @@ static const char CORPUS[] =
 /* ================================================================== */
 /*  main                                                               */
 /* ================================================================== */
+static void print_usage(const char *prog) {
+    printf(
+"Sentinel v%s — a self-contained deep-RNN AI agent in pure C.\n"
+"A character-level neural net (no libraries) that learns from text, answers\n"
+"CVE questions from its corpus, and forks sub-agents to do small tasks.\n"
+"\n"
+"USAGE\n"
+"  %s                      train on the built-in/checkpointed model, print a\n"
+"                            sample, then enter the interactive AI loop\n"
+"  %s --train <path...>    consolidate files/dirs into a corpus and train on it\n"
+"  %s --agent \"<task>\"     run once as a single sub-agent for <task>\n"
+"  %s --help | -h          show this help\n"
+"  %s --version            print version\n"
+"\n"
+"INTERACTIVE LOOP (what to type once it's running)\n"
+"  TASK: <something>         spawn a sub-agent (cyber / coding / general):\n"
+"      TASK: list files in this directory\n"
+"      TASK: write a C function to reverse a string\n"
+"      TASK: scan local network ports\n"
+"  show me a cve about <x>   ask about a vulnerability — searches your corpus\n"
+"                            and prints a real CVE (no 'TASK:' needed)\n"
+"  <any other text>          is absorbed as live training data (online learning)\n"
+"  Ctrl-D                    quit (the model is checkpointed on exit)\n"
+"\n"
+"USING IT AS AN AI (typical first run)\n"
+"  ./start.sh                build + fetch data + train + launch, one command\n"
+"  ./fetch_corpus.sh         download real security/coding/CVE data into ./corpus\n"
+"  %s --train corpus       teach it everything you fetched\n"
+"\n"
+"ENVIRONMENT VARIABLES\n"
+"  SLM_EPOCHS=N              training iterations (default 2000)\n"
+"  SLM_NO_EXEC=1             agents PLAN ONLY — print commands, run nothing\n"
+"\n"
+"SAFETY\n"
+"  Sub-agents run real shell commands but a hard guard refuses 'sudo' and\n"
+"  destructive patterns (rm -rf /, mkfs, dd, fork bombs, shutdown, ...).\n"
+"  Set SLM_NO_EXEC=1 to disable command execution entirely.\n",
+        VERSION, prog, prog, prog, prog, prog, prog);
+}
+
 int main(int argc, char **argv) {
+    /* ---- help / version ---- */
+    if (argc >= 2 && (strcmp(argv[1], "--help") == 0 ||
+                      strcmp(argv[1], "-h") == 0 ||
+                      strcmp(argv[1], "help") == 0)) {
+        print_usage(argv[0]);
+        return 0;
+    }
+    if (argc >= 2 && (strcmp(argv[1], "--version") == 0 ||
+                      strcmp(argv[1], "-v") == 0)) {
+        printf("Sentinel v%s\n", VERSION);
+        return 0;
+    }
+
     /* ---- sub-agent mode ---- */
     if (argc >= 3 && strcmp(argv[1], "--agent") == 0)
         return run_agent(argv[2]);
