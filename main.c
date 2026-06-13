@@ -47,18 +47,21 @@
 /*  recompiling is all that's needed to deepen / widen the model.      */
 /* ------------------------------------------------------------------ */
 #define VOCAB       128     /* character-level tokenizer: 7-bit ASCII   */
-#define EMBED       96      /* learned embedding dimension              */
-#define HIDDEN      384     /* hidden units per GRU layer               */
+#define EMBED       128     /* learned embedding dimension              */
+#define HIDDEN      1536    /* hidden units per GRU layer               */
 #define NUM_LAYERS  3       /* stacked GRU layers (depth)               */
 #define SEQ_LEN     32      /* BPTT unroll length                       */
 #define LR          0.10    /* base learning rate (Adagrad)             */
 #define CLIP        5.0     /* gradient clipping bound                  */
-/* ~2.7M parameters and ~200 MB RAM at these defaults. This is about the
- * sweet spot for CPU training. Lower HIDDEN/NUM_LAYERS if training is too
- * slow on a small machine (e.g. a Raspberry Pi Zero); raise them for more
- * capacity on a server. The realistic "subscription" deployment is: train
- * the big model once on a fast box, ship the resulting sentinel.bin, and let
- * users run inference. The code is dimension-generic either way. */
+/* ~42.7M parameters and ~1.0 GB RAM at these defaults. Memory cost is fixed
+ * at ~24 bytes/param (weight + gradient + Adagrad memory, all double), so:
+ *   1 GB RAM  ~= 42M params (this default)   8 GB RAM ~= 330M params.
+ * RAM is not the wall; CPU is: training is O(NUM_LAYERS * HIDDEN^2 * SEQ_LEN)
+ * per step (~4 billion mults/step here), so a real train at this size takes
+ * hours on a Pi — train on a faster box and copy sentinel.bin, or run
+ * overnight. Lower HIDDEN for faster iteration. To push past ~80M params,
+ * switch double->float (halves RAM, speeds matmuls). VOCAB must stay a power
+ * of two (the tokenizer masks with VOCAB-1). Dimension-generic otherwise. */
 
 #define CKPT_MAGIC  0x534C4D32u   /* "SLM2" — GRU checkpoint format */
 #define CKPT_PATH   "sentinel.bin"

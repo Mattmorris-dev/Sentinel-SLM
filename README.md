@@ -22,9 +22,10 @@ external machine-learning libraries** (only libc + libm). It implements, by hand
   `fork()`/`exec()`s a separate process specialised in **cybersecurity / coding /
   general** work, which runs a **safe** shell command and streams the result back.
 
-It's a genuine deep network (~2.7M parameters at default size): real weights, real
-gradients, real GRU backprop. At this scale it learns character/word statistics rather
-than fluent prose — the value is the complete, dependency-free, fully local pipeline.
+It's a genuine deep network (~42.7M parameters, ~1 GB RAM, at the default size): real
+weights, real gradients, real GRU backprop. At this scale it learns character/word
+statistics rather than fluent prose — the value is the complete, dependency-free,
+fully local pipeline.
 
 ## Build
 
@@ -101,7 +102,7 @@ Add any repo you like to those lists.
 ## Architecture (where the depth lives)
 
 ```
-token --> [embedding] --> [RNN layer 0] --> [RNN layer 1] --> ... --> [softmax] --> next char
+token --> [embedding] --> [GRU layer 0] --> [GRU layer 1] --> ... --> [softmax] --> next char
                                ^  |              ^  |
                                +--+ hidden state +--+ hidden state   (fed back every step)
 ```
@@ -112,8 +113,8 @@ token --> [embedding] --> [RNN layer 0] --> [RNN layer 1] --> ... --> [softmax] 
   (`NUM_LAYERS`, `HIDDEN`, `EMBED`, `SEQ_LEN`) and recompile. The layer code is
   dimension-generic, so nothing else needs to change. (Changing the architecture
   starts a fresh checkpoint automatically — the old one records its own dims.)
-  The default build is **3 GRU layers, HIDDEN=384, EMBED=96 ≈ 2.7M parameters**
-  (~200 MB RAM); raising `HIDDEN`/`NUM_LAYERS` scales the parameter count roughly
+  The default build is **3 GRU layers, HIDDEN=1536, EMBED=128 ≈ 42.7M parameters** (~1 GB RAM,
+  ~24 bytes/param); raising `HIDDEN`/`NUM_LAYERS` scales the parameter count roughly
   with `NUM_LAYERS * HIDDEN²`. `VOCAB` must stay a power of two (128 = ASCII, or
   256 for full-byte / UTF-8-bytes) because the tokenizer masks with `VOCAB-1`.
 - **Teach it more:** `./sentinel --train yourtext.txt`, or just pipe text in on
