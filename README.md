@@ -55,6 +55,32 @@ help if they have more data to learn from — this is how you supply it:
 SLM_EPOCHS=20000 ./local_slm --train ./my_notes ./some_repo/src
 ```
 
+### Fetch real-world data: `fetch_corpus.sh`
+
+To train on real security + coding knowledge and live CVE data, the included
+`fetch_corpus.sh` clones a curated set of **high-starred, free, open-source**
+GitHub repositories plus public CVE writeups into `./corpus`, then you train on
+the whole pile. It is **100% free and vendor-neutral** — only `git` + `curl`,
+no API keys, no paid services, no Claude or any other vendor dependency, and the
+training runs fully offline afterwards.
+
+```sh
+QUICK=1 ./fetch_corpus.sh        # small/fast demo: famous CVEs + a couple repos
+./fetch_corpus.sh                # full corpus (several repos + recent CVE years)
+CVE_YEARS="2022 2023 2024 2025" ./fetch_corpus.sh
+./local_slm --train corpus       # consolidate + train on everything fetched
+```
+
+Sources are grouped in editable arrays at the top of the script:
+- **Security:** OWASP Cheat Sheets, PayloadsAllTheThings, the-book-of-secret-knowledge
+- **Coding:** TheAlgorithms (C and Python)
+- **Neural-net reference:** micrograd, char-rnn, nanoGPT (so it can also learn the
+  code of models like itself)
+- **CVE data:** `trickest/cve` — 150k+ real vulnerability writeups (Log4Shell, xz
+  backdoor, Heartbleed, …), pulled per-year via sparse checkout so it stays bounded
+
+Add any repo you like to those lists.
+
 ## Architecture (where the depth lives)
 
 ```
