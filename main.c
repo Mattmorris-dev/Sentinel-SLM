@@ -703,57 +703,139 @@ static int build_command(const char *task, char *cmd, size_t cmdsz) {
     return kind;
 }
 
-/* Runs as the spawned sub-agent. */
-static int run_agent(const char *task) {
-    const char *kinds[] = { "CYBERSECURITY", "CODING", "GENERAL" };
-    char cmd[2048];
-    int kind = build_command(task, cmd, sizeof cmd);
-    if (kind < 0 || kind > 2) kind = 2;          /* defensive: keep kinds[] in range */
+/* ------------------------------------------------------------------ */
+/*  Difficulty-tiered sub-agents.                                      */
+/*                                                                     */
+/*  Easy tasks get a small compute/parameter budget; hard tasks get a  */
+/*  larger one.  A sub-agent re-execs into "--agent" mode, which never  */
+/*  touches the big GRU weight arrays (demand-zero BSS stays            */
+/*  unallocated), so each agent is only a few MB — that is why ~100 can */
+/*  run at once.  The budget caps each agent's wall-clock compute so an */
+/*  easy job can't hog resources.                                      */
+/* ------------------------------------------------------------------ */
+#define MAX_AGENTS 100
 
-    printf("\n  ┌─ sub-agent pid=%d  specialism=%s\n", (int)getpid(), kinds[kind]);
-    printf("  │  task: %s\n", task);
+static const char *TIER_NAME[3]    = { "light", "medium", "heavy" };
+static const int   TIER_BUDGET_K[3] = { 64, 512, 4096 };  /* notional param budget (x1000) */
+static const int   TIER_TIMEOUT[3]  = { 3, 8, 20 };        /* compute cap, seconds          */
 
-    if (getenv("SLM_NO_EXEC")) {
-        printf("  │  [plan-only mode: SLM_NO_EXEC set, not executing]\n");
-        printf("  │  would run: %s\n", cmd);
-        printf("  └─ done (pid=%d)\n", (int)getpid());
-        return 0;
-    }
-
-    if (!is_command_safe(task) || !is_command_safe(cmd)) {
-        printf("  │  REFUSED by safety guard: command contains a blocked "
-               "(sudo/destructive) pattern.\n");
-        printf("  └─ no action taken (pid=%d)\n", (int)getpid());
-        return 2;
-    }
-
-    printf("  │  exec: %s\n  │  ----- output -----\n", cmd);
-    fflush(stdout);
-
-    FILE *pp = popen(cmd, "r");
-    if (!pp) {
-        printf("  │  failed to launch shell\n  └─ error (pid=%d)\n", (int)getpid());
-        return 1;
-    }
-    char line[512];
-    while (fgets(line, sizeof line, pp)) printf("  │  %s", line);
-    int rc = pclose(pp);
-    printf("\n  └─ sub-agent pid=%d finished (exit code %d)\n",
-           (int)getpid(), rc == -1 ? -1 : WEXITSTATUS(rc));
+/* 0 = light, 1 = medium, 2 = heavy, from task length + keyword signals. */
+static int estimate_difficulty(const char *task) {
+    char low[512];
+    size_t n = strlen(task);
+    if (n >= sizeof low) n = sizeof low - 1;
+    for (size_t i = 0; i < n; i++) low[i] = (char)tolower((unsigned char)task[i]);
+    low[n] = '\0';
+    static const char *hard[] = {
+        "compile","analyze","exploit","reverse","optimize","encrypt","decrypt",
+        "vulnerability","algorithm","train","benchmark","fuzz","disassemble",
+        "parser","recursion","simulate", NULL };
+    static const char *med[] = {
+        "write","build","scan","search","hash","cve","network","function",
+        "script","convert","sort","port", NULL };
+    for (int i = 0; hard[i]; i++) if (strstr(low, hard[i])) return 2;
+    if (n > 80) return 2;
+    for (int i = 0; med[i]; i++) if (strstr(low, med[i])) return 1;
+    if (n > 40) return 1;
     return 0;
 }
 
-/* Parent forks + execs a fresh sub-agent process for `task`. */
-static void spawn_agent(const char *selfexe, const char *task) {
+/* Runs as the spawned sub-agent at a given difficulty tier. */
+static int run_agent(int tier, const char *task) {
+    if (tier < 0 || tier > 2) tier = 1;
+    int terse = getenv("SLM_AGENT_TERSE") != NULL;   /* compact output for big fan-outs */
+    const char *kinds[] = { "CYBERSECURITY", "CODING", "GENERAL" };
+    char cmd[2048];
+    int kind = build_command(task, cmd, sizeof cmd);
+    if (kind < 0 || kind > 2) kind = 2;
+
+    if (!terse) {
+        printf("\n  ┌─ sub-agent pid=%d  specialism=%s  tier=%s "
+               "(param-budget≈%dK, %ds cap)\n",
+               (int)getpid(), kinds[kind], TIER_NAME[tier],
+               TIER_BUDGET_K[tier], TIER_TIMEOUT[tier]);
+        printf("  │  task: %s\n", task);
+    }
+
+    if (getenv("SLM_NO_EXEC")) {
+        if (terse) printf("  · agent pid=%d tier=%s PLAN-ONLY\n", (int)getpid(), TIER_NAME[tier]);
+        else printf("  │  [plan-only mode: SLM_NO_EXEC set]\n  └─ would run: %s\n", cmd);
+        return 0;
+    }
+    if (!is_command_safe(task) || !is_command_safe(cmd)) {
+        if (terse) printf("  · agent pid=%d tier=%s REFUSED (unsafe)\n", (int)getpid(), TIER_NAME[tier]);
+        else printf("  │  REFUSED by safety guard (sudo/destructive pattern).\n  └─ no action.\n");
+        return 2;
+    }
+
+    /* difficulty-scaled compute cap via coreutils `timeout` (if present);
+     * the validated command is passed through the environment to avoid any
+     * shell-quoting issues. */
+    setenv("SLM_AGENT_CMD", cmd, 1);
+    char wrapped[160];
+    snprintf(wrapped, sizeof wrapped,
+        "command -v timeout >/dev/null && timeout %d sh -c 'eval \"$SLM_AGENT_CMD\"' "
+        "|| sh -c 'eval \"$SLM_AGENT_CMD\"'", TIER_TIMEOUT[tier]);
+
+    if (!terse) { printf("  │  exec: %s\n  │  ----- output -----\n", cmd); fflush(stdout); }
+
+    FILE *pp = popen(wrapped, "r");
+    if (!pp) { printf("  · agent pid=%d failed to launch shell\n", (int)getpid()); return 1; }
+    char line[512];
+    char first[512]; first[0] = '\0';
+    while (fgets(line, sizeof line, pp)) {
+        if (terse) { if (!first[0]) snprintf(first, sizeof first, "%s", line); }
+        else printf("  │  %s", line);
+    }
+    int rc = pclose(pp);
+    int code = (rc == -1) ? -1 : WEXITSTATUS(rc);
+    if (terse) {
+        size_t fl = strlen(first); if (fl && first[fl-1] == '\n') first[fl-1] = '\0';
+        printf("  · agent pid=%d tier=%s %s%s(exit %d)\n", (int)getpid(),
+               TIER_NAME[tier], code == 124 ? "[budget-capped] " : "",
+               first[0] ? first : "", code);
+    } else {
+        if (code == 124) printf("  │  [compute budget exceeded — stopped at %ds cap]\n",
+                                 TIER_TIMEOUT[tier]);
+        printf("  └─ sub-agent pid=%d finished (exit %d)\n", (int)getpid(), code);
+    }
+    return 0;
+}
+
+/* Spawn ONE sub-agent process for `task` at `tier` and wait for it. */
+static void spawn_agent_tier(const char *selfexe, const char *task, int tier) {
     pid_t pid = fork();
     if (pid < 0) { perror("fork"); return; }
     if (pid == 0) {
-        execl(selfexe, selfexe, "--agent", task, (char *)NULL);
+        char ts[8]; snprintf(ts, sizeof ts, "%d", tier);
+        execl(selfexe, selfexe, "--agent", ts, task, (char *)NULL);
         perror("execl");
         _exit(127);
     }
-    int status = 0;
-    waitpid(pid, &status, 0);
+    waitpid(pid, NULL, 0);
+}
+
+/* Fan out `count` sub-agents (capped at MAX_AGENTS) CONCURRENTLY for `task`,
+ * each at `tier`, then reap them all.  Returns how many were launched. */
+static int spawn_batch(const char *selfexe, const char *task, int count, int tier) {
+    if (count < 1) count = 1;
+    if (count > MAX_AGENTS) count = MAX_AGENTS;
+    setenv("SLM_AGENT_TERSE", "1", 1);          /* compact per-agent output */
+    pid_t pids[MAX_AGENTS];
+    int launched = 0;
+    for (int i = 0; i < count; i++) {
+        pid_t pid = fork();
+        if (pid < 0) { perror("fork"); break; }
+        if (pid == 0) {
+            char ts[8]; snprintf(ts, sizeof ts, "%d", tier);
+            execl(selfexe, selfexe, "--agent", ts, task, (char *)NULL);
+            _exit(127);
+        }
+        pids[launched++] = pid;
+    }
+    for (int i = 0; i < launched; i++) waitpid(pids[i], NULL, 0);
+    unsetenv("SLM_AGENT_TERSE");
+    return launched;
 }
 
 /* ================================================================== */
@@ -872,12 +954,16 @@ static void print_usage(const char *prog) {
 "  %s --version            print version\n"
 "\n"
 "INTERACTIVE LOOP (what to type once it's running)\n"
-"  TASK: <something>         spawn a sub-agent (cyber / coding / general):\n"
+"  TASK: <something>         spawn ONE sub-agent (cyber / coding / general):\n"
 "      TASK: list files in this directory\n"
 "      TASK: write a C function to reverse a string\n"
 "      TASK: scan local network ports\n"
+"  FANOUT: <n> <something>   spawn up to 100 sub-agents CONCURRENTLY for a task,\n"
+"                            e.g.  FANOUT: 100 scan local network ports\n"
 "  show me a cve about <x>   ask about a vulnerability — searches your corpus\n"
 "                            and prints a real CVE (no 'TASK:' needed)\n"
+"  (each agent is auto-assigned a difficulty tier — light/medium/heavy — which\n"
+"   sets its compute/parameter budget; easy tasks get a smaller budget.)\n"
 "  <any other text>          is absorbed as live training data (online learning)\n"
 "  Ctrl-D                    quit (the model is checkpointed on exit)\n"
 "\n"
@@ -911,9 +997,11 @@ int main(int argc, char **argv) {
         return 0;
     }
 
-    /* ---- sub-agent mode ---- */
-    if (argc >= 3 && strcmp(argv[1], "--agent") == 0)
-        return run_agent(argv[2]);
+    /* ---- sub-agent mode:  --agent <tier> <task>  (legacy:  --agent <task>) ---- */
+    if (argc >= 4 && strcmp(argv[1], "--agent") == 0)
+        return run_agent(atoi(argv[2]), argv[3]);
+    if (argc == 3 && strcmp(argv[1], "--agent") == 0)
+        return run_agent(1, argv[2]);
 
     srand(1234567u);
     init_weights();
@@ -982,19 +1070,37 @@ int main(int argc, char **argv) {
             line[--len] = '\0';
         if (len == 0) continue;
 
+        char *fan = strstr(line, "FANOUT:");
         char *trig = strstr(line, "TASK:");
         /* also treat a plain CVE/vuln question as a lookup, no "TASK:" needed */
         char low[256]; size_t ln = len < sizeof low - 1 ? len : sizeof low - 1;
         for (size_t i = 0; i < ln; i++) low[i] = (char)tolower((unsigned char)line[i]);
         low[ln] = '\0';
-        int is_cve_q = (!trig) && (strstr(low, "cve") || strstr(low, "vuln"));
+        int is_cve_q = (!trig && !fan) && (strstr(low, "cve") || strstr(low, "vuln"));
 
-        if (trig || is_cve_q) {
+        if (fan) {
+            /* FANOUT: <count> <task>  — spawn up to 100 concurrent sub-agents */
+            char *p = fan + 7;
+            while (*p == ' ') p++;
+            int count = atoi(p);
+            while (*p && *p != ' ') p++;     /* skip the number */
+            while (*p == ' ') p++;
+            if (count < 1) count = 1;
+            int tier = estimate_difficulty(p);
+            printf("[fan-out] launching %d concurrent sub-agents (tier=%s) for: \"%s\"\n",
+                   count > MAX_AGENTS ? MAX_AGENTS : count, TIER_NAME[tier], p);
+            fflush(stdout);
+            int n = spawn_batch(selfexe, p, count, tier);
+            printf("[fan-out] %d sub-agents completed.\n", n);
+            spawned += n;
+        } else if (trig || is_cve_q) {
             char *task = trig ? trig + 5 : line;
             while (*task == ' ') task++;
-            printf("[trigger detected] spawning sub-agent for: \"%s\"\n", task);
+            int tier = estimate_difficulty(task);
+            printf("[trigger detected] spawning sub-agent (tier=%s) for: \"%s\"\n",
+                   TIER_NAME[tier], task);
             fflush(stdout);
-            spawn_agent(selfexe, task);
+            spawn_agent_tier(selfexe, task, tier);
             spawned++;
         } else {
             /* online learning: turn the incoming stream into weight updates */

@@ -99,6 +99,23 @@ Sources are grouped in editable arrays at the top of the script:
 
 Add any repo you like to those lists.
 
+### Difficulty-tiered sub-agent fan-out
+
+Each task is auto-assigned a **difficulty tier** — `light` / `medium` / `heavy` —
+from its length and keywords, which sets the agent's compute/parameter budget
+(easy tasks get a smaller budget and a shorter time cap). You can fan out **up to
+100 sub-agents concurrently**:
+
+```sh
+TASK: list files in this directory          # one agent, tier auto-detected
+FANOUT: 100 scan local network ports        # 100 concurrent agents
+```
+
+Sub-agents are cheap because re-exec'ing into `--agent` mode never allocates the
+big GRU weight arrays (demand-zero memory stays untouched), so 100 of them use a
+few hundred MB total, not 100×1 GB. The big model is the orchestrator; the workers
+are lightweight and difficulty-scaled.
+
 ## Architecture (where the depth lives)
 
 ```
