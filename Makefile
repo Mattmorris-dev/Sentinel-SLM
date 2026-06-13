@@ -57,7 +57,7 @@ uninstall:             ## remove the installed binary
 
 package:               ## build a source release tarball
 	tar czf sentinel-$(VERSION)-src.tar.gz \
-	    main.c fetch_corpus.sh start.sh Makefile README.md LICENSE .gitignore \
+	    main.c fetch_corpus.sh start.sh Makefile README.md PITCH.md LICENSE .gitignore \
 	    assets/sentinel-logo.svg .github/workflows/c-cpp.yml
 	@echo "built sentinel-$(VERSION)-src.tar.gz"
 
