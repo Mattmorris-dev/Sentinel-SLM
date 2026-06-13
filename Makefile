@@ -2,11 +2,13 @@
 # Free software (Apache-2.0). No external ML libraries; only libc + libm.
 
 CC      ?= gcc
-CFLAGS  ?= -O2 -Wall
+# -mcmodel=large is required because the default model uses >2 GB of static
+# arrays (it overflows the small code model's 32-bit relocations otherwise).
+CFLAGS  ?= -O2 -Wall -mcmodel=large
 LDLIBS   = -lm
 BIN      = sentinel
 PREFIX  ?= /usr/local
-VERSION ?= 0.2.0
+VERSION ?= 0.3.0
 
 .PHONY: all run train fetch quick-fetch clean distclean install uninstall package help
 

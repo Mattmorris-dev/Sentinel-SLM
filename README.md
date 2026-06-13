@@ -13,7 +13,7 @@ external machine-learning libraries** (only libc + libm). It implements, by hand
   feedback, so it processes a continuous stream with **no fixed token-context window**,
 - a **manual matrix-multiply** (`matvec`) used for every layer at every timestep,
 - a real **backprop-through-time** trainer (cross-entropy loss, gradient clipping,
-  Adagrad) — full gradients through all three GRU gates,
+  Adam) — full gradients through all three GRU gates,
 - **checkpoint persistence** + **online learning** so the network keeps growing its
   skills across runs,
 - a **CVE lookup agent**: ask `show me a cve about <x>` and it searches the fetched
@@ -22,7 +22,7 @@ external machine-learning libraries** (only libc + libm). It implements, by hand
   `fork()`/`exec()`s a separate process specialised in **cybersecurity / coding /
   general** work, which runs a **safe** shell command and streams the result back.
 
-It's a genuine deep network (~42.7M parameters, ~1 GB RAM, at the default size): real
+It's a genuine deep network (~101M parameters, ~3.2 GB RAM, at the default size): real
 weights, real gradients, real GRU backprop. At this scale it learns character/word
 statistics rather than fluent prose — the value is the complete, dependency-free,
 fully local pipeline.
@@ -30,7 +30,7 @@ fully local pipeline.
 ## Build
 
 ```sh
-gcc -O2 -Wall -o sentinel main.c -lm
+gcc -O2 -Wall -mcmodel=large -o sentinel main.c -lm
 ```
 
 …or use the Makefile:
@@ -59,7 +59,17 @@ Other modes:
 ./sentinel --train corpus.txt         # absorb one corpus file, then checkpoint
 ./sentinel --train ./data             # consolidate a WHOLE directory tree
 ./sentinel --train a.txt b.md ./src   # consolidate several files + dirs at once
+./sentinel --tui                      # styled terminal UI (agent console)
+./sentinel --serve 8080               # web GUI at http://127.0.0.1:8080 (localhost only)
 ```
+
+### Interfaces: TUI and web GUI
+
+- **`./sentinel --tui`** — a colored, framed terminal console for typing tasks,
+  `FANOUT:` batches and CVE questions interactively.
+- **`./sentinel --serve [port]`** — a tiny built-in HTTP server (pure C sockets,
+  no dependencies) serving a chat-style web page. It **binds to 127.0.0.1 only**
+  because agents run real shell commands — do not expose it to a network.
 
 ### Data consolidation (feed the bigger net more data)
 
@@ -130,8 +140,8 @@ token --> [embedding] --> [GRU layer 0] --> [GRU layer 1] --> ... --> [softmax] 
   (`NUM_LAYERS`, `HIDDEN`, `EMBED`, `SEQ_LEN`) and recompile. The layer code is
   dimension-generic, so nothing else needs to change. (Changing the architecture
   starts a fresh checkpoint automatically — the old one records its own dims.)
-  The default build is **3 GRU layers, HIDDEN=1536, EMBED=128 ≈ 42.7M parameters** (~1 GB RAM,
-  ~24 bytes/param); raising `HIDDEN`/`NUM_LAYERS` scales the parameter count roughly
+  The default build is **3 GRU layers, HIDDEN=2368, EMBED=128 ≈ 101M parameters** (~3.2 GB RAM,
+  ~32 bytes/param with Adam). Note: >2 GB of static arrays needs `-mcmodel=large`; raising `HIDDEN`/`NUM_LAYERS` scales the parameter count roughly
   with `NUM_LAYERS * HIDDEN²`. `VOCAB` must stay a power of two (128 = ASCII, or
   256 for full-byte / UTF-8-bytes) because the tokenizer masks with `VOCAB-1`.
 - **Teach it more:** `./sentinel --train yourtext.txt`, or just pipe text in on

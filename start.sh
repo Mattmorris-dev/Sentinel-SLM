@@ -44,7 +44,7 @@ if ! command -v gcc >/dev/null 2>&1; then
 fi
 if [ ! -x ./sentinel ] || [ main.c -nt ./sentinel ]; then
   log "building ./sentinel ..."
-  gcc -O2 -Wall -o sentinel main.c -lm || { echo "build failed" >&2; exit 1; }
+  gcc -O2 -Wall -mcmodel=large -o sentinel main.c -lm || { echo "build failed" >&2; exit 1; }
 else
   log "binary up to date — skipping build."
 fi

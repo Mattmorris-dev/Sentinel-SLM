@@ -25,7 +25,7 @@
  *   ./sentinel --agent "<t>"   run as a spawned sub-agent for task <t>.
  *   ./sentinel --train <file>  train extra epochs on an external corpus file.
  *
- * Build:  gcc -O2 -Wall -o sentinel main.c -lm
+ * Build:  gcc -O2 -Wall -mcmodel=large -o sentinel main.c -lm
  */
 
 #include <stdio.h>
@@ -40,6 +40,10 @@
 #include <dirent.h>
 #include <strings.h>
 #include <limits.h>
+#include <signal.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
 
 /* ------------------------------------------------------------------ */
 /*  Hyperparameters — raise these to grow the network's capacity.      */
@@ -48,14 +52,18 @@
 /* ------------------------------------------------------------------ */
 #define VOCAB       128     /* character-level tokenizer: 7-bit ASCII   */
 #define EMBED       128     /* learned embedding dimension              */
-#define HIDDEN      1536    /* hidden units per GRU layer               */
+#define HIDDEN      2368    /* hidden units per GRU layer               */
 #define NUM_LAYERS  3       /* stacked GRU layers (depth)               */
 #define SEQ_LEN     32      /* BPTT unroll length                       */
-#define LR          0.10    /* base learning rate (Adagrad)             */
+#define LR          0.002   /* base learning rate (Adam)                */
 #define CLIP        5.0     /* gradient clipping bound                  */
-/* ~42.7M parameters and ~1.0 GB RAM at these defaults. Memory cost is fixed
- * at ~24 bytes/param (weight + gradient + Adagrad memory, all double), so:
- *   1 GB RAM  ~= 42M params (this default)   8 GB RAM ~= 330M params.
+#define ADAM_B1     0.9     /* Adam first-moment decay                  */
+#define ADAM_B2     0.999   /* Adam second-moment decay                 */
+#define ADAM_EPS    1e-8    /* Adam epsilon                             */
+/* ~101M parameters and ~3.2 GB RAM at these defaults. With the Adam optimizer
+ * each weight carries TWO moment estimates, so memory is ~32 bytes/param
+ * (weight + gradient + m + v, all double):
+ *   1.5 GB RAM ~= 47M params   3 GB RAM ~= 94M params (this default ~101M).
  * RAM is not the wall; CPU is: training is O(NUM_LAYERS * HIDDEN^2 * SEQ_LEN)
  * per step (~4 billion mults/step here), so a real train at this size takes
  * hours on a Pi — train on a faster box and copy sentinel.bin, or run
@@ -63,9 +71,9 @@
  * switch double->float (halves RAM, speeds matmuls). VOCAB must stay a power
  * of two (the tokenizer masks with VOCAB-1). Dimension-generic otherwise. */
 
-#define CKPT_MAGIC  0x534C4D32u   /* "SLM2" — GRU checkpoint format */
+#define CKPT_MAGIC  0x534C4D33u   /* "SLM3" — GRU + Adam checkpoint format */
 #define CKPT_PATH   "sentinel.bin"
-#define VERSION     "0.2.0"
+#define VERSION     "0.3.0"
 
 /* ------------------------------------------------------------------ */
 /*  Parameters — a stacked GRU (gated recurrent unit) network.         */
@@ -94,12 +102,22 @@ static double dbg  [NUM_LAYERS][NGATE][HIDDEN];
 static double dWhy [VOCAB][HIDDEN];
 static double dby  [VOCAB];
 
+/* Adam first-moment (m) and second-moment (v) estimates per weight. */
 static double mWemb[VOCAB][EMBED];
 static double mWg  [NUM_LAYERS][NGATE][HIDDEN][HIDDEN];
 static double mUg  [NUM_LAYERS][NGATE][HIDDEN][HIDDEN];
 static double mbg  [NUM_LAYERS][NGATE][HIDDEN];
 static double mWhy [VOCAB][HIDDEN];
 static double mby  [VOCAB];
+
+static double vWemb[VOCAB][EMBED];
+static double vWg  [NUM_LAYERS][NGATE][HIDDEN][HIDDEN];
+static double vUg  [NUM_LAYERS][NGATE][HIDDEN][HIDDEN];
+static double vbg  [NUM_LAYERS][NGATE][HIDDEN];
+static double vWhy [VOCAB][HIDDEN];
+static double vby  [VOCAB];
+
+static long g_adam_t = 0;   /* Adam timestep, for bias correction */
 
 /* Per-timestep activation cache used by backprop-through-time. */
 static int    g_in [SEQ_LEN];
@@ -186,19 +204,29 @@ static void init_weights(void) {
     memset(mWemb, 0, sizeof mWemb); memset(mWg, 0, sizeof mWg);
     memset(mUg, 0, sizeof mUg);     memset(mbg, 0, sizeof mbg);
     memset(mWhy, 0, sizeof mWhy);   memset(mby, 0, sizeof mby);
+    memset(vWemb, 0, sizeof vWemb); memset(vWg, 0, sizeof vWg);
+    memset(vUg, 0, sizeof vUg);     memset(vbg, 0, sizeof vbg);
+    memset(vWhy, 0, sizeof vWhy);   memset(vby, 0, sizeof vby);
+    g_adam_t = 0;
 }
 
 /* ------------------------------------------------------------------ */
 /*  One BPTT step over a SEQ_LEN window.  Returns the cross-entropy    */
-/*  loss; updates weights in place (Adagrad) and carries hidden state. */
+/*  loss; updates weights in place (Adam) and carries hidden state.    */
 /* ------------------------------------------------------------------ */
-static void adagrad(double *p, double *g, double *m, int n) {
+/* Adam update with bias correction.  bc1 = 1-B1^t, bc2 = 1-B2^t are passed in
+ * so they're computed once per step, not once per weight. */
+static void adam(double *p, double *g, double *m, double *v, int n,
+                 double bc1, double bc2) {
     for (int i = 0; i < n; i++) {
         double grad = g[i];
         if (grad >  CLIP) grad =  CLIP;
         if (grad < -CLIP) grad = -CLIP;
-        m[i] += grad * grad;
-        p[i] -= LR * grad / sqrt(m[i] + 1e-8);
+        m[i] = ADAM_B1 * m[i] + (1.0 - ADAM_B1) * grad;
+        v[i] = ADAM_B2 * v[i] + (1.0 - ADAM_B2) * grad * grad;
+        double mhat = m[i] / bc1;
+        double vhat = v[i] / bc2;
+        p[i] -= LR * mhat / (sqrt(vhat) + ADAM_EPS);
     }
 }
 
@@ -354,14 +382,19 @@ static double train_step(const int *inputs, const int *targets,
         }
     }
 
-    /* ---- Adagrad update ---- */
-    adagrad(&Wemb[0][0], &dWemb[0][0], &mWemb[0][0], VOCAB * EMBED);
-    adagrad(&Why[0][0],  &dWhy[0][0],  &mWhy[0][0],  VOCAB * HIDDEN);
-    adagrad(by, dby, mby, VOCAB);
+    /* ---- Adam update (bias-correction factors computed once per step) ---- */
+    g_adam_t++;
+    double bc1 = 1.0 - pow(ADAM_B1, (double)g_adam_t);
+    double bc2 = 1.0 - pow(ADAM_B2, (double)g_adam_t);
+    adam(&Wemb[0][0], &dWemb[0][0], &mWemb[0][0], &vWemb[0][0], VOCAB * EMBED, bc1, bc2);
+    adam(&Why[0][0],  &dWhy[0][0],  &mWhy[0][0],  &vWhy[0][0],  VOCAB * HIDDEN, bc1, bc2);
+    adam(by, dby, mby, vby, VOCAB, bc1, bc2);
     for (int l = 0; l < NUM_LAYERS; l++) {
-        adagrad(&Wg[l][0][0][0], &dWg[l][0][0][0], &mWg[l][0][0][0], NGATE * HIDDEN * HIDDEN);
-        adagrad(&Ug[l][0][0][0], &dUg[l][0][0][0], &mUg[l][0][0][0], NGATE * HIDDEN * HIDDEN);
-        adagrad(&bg[l][0][0],    &dbg[l][0][0],    &mbg[l][0][0],    NGATE * HIDDEN);
+        adam(&Wg[l][0][0][0], &dWg[l][0][0][0], &mWg[l][0][0][0], &vWg[l][0][0][0],
+             NGATE * HIDDEN * HIDDEN, bc1, bc2);
+        adam(&Ug[l][0][0][0], &dUg[l][0][0][0], &mUg[l][0][0][0], &vUg[l][0][0][0],
+             NGATE * HIDDEN * HIDDEN, bc1, bc2);
+        adam(&bg[l][0][0], &dbg[l][0][0], &mbg[l][0][0], &vbg[l][0][0], NGATE * HIDDEN, bc1, bc2);
     }
 
     /* carry the last hidden state forward (continuous, no context limit) */
@@ -467,6 +500,13 @@ static void save_model(const char *path) {
     fwrite(mbg,   sizeof mbg,   1, f);
     fwrite(mWhy,  sizeof mWhy,  1, f);
     fwrite(mby,   sizeof mby,   1, f);
+    fwrite(vWemb, sizeof vWemb, 1, f);
+    fwrite(vWg,   sizeof vWg,   1, f);
+    fwrite(vUg,   sizeof vUg,   1, f);
+    fwrite(vbg,   sizeof vbg,   1, f);
+    fwrite(vWhy,  sizeof vWhy,  1, f);
+    fwrite(vby,   sizeof vby,   1, f);
+    fwrite(&g_adam_t, sizeof g_adam_t, 1, f);
     fclose(f);
 }
 
@@ -493,6 +533,13 @@ static int load_model(const char *path) {
     ok &= fread(mbg,   sizeof mbg,   1, f) == 1;
     ok &= fread(mWhy,  sizeof mWhy,  1, f) == 1;
     ok &= fread(mby,   sizeof mby,   1, f) == 1;
+    ok &= fread(vWemb, sizeof vWemb, 1, f) == 1;
+    ok &= fread(vWg,   sizeof vWg,   1, f) == 1;
+    ok &= fread(vUg,   sizeof vUg,   1, f) == 1;
+    ok &= fread(vbg,   sizeof vbg,   1, f) == 1;
+    ok &= fread(vWhy,  sizeof vWhy,  1, f) == 1;
+    ok &= fread(vby,   sizeof vby,   1, f) == 1;
+    ok &= fread(&g_adam_t, sizeof g_adam_t, 1, f) == 1;
     fclose(f);
     return ok;
 }
@@ -838,6 +885,176 @@ static int spawn_batch(const char *selfexe, const char *task, int count, int tie
     return launched;
 }
 
+/* Run a task and capture the agent output into `out` (for the GUI/TUI).
+ * Honors the safety guard and SLM_NO_EXEC. Returns bytes written. */
+static size_t run_task_capture(const char *task, char *out, size_t outsz) {
+    int tier = estimate_difficulty(task);
+    char cmd[2048];
+    int kind = build_command(task, cmd, sizeof cmd);
+    if (kind < 0 || kind > 2) kind = 2;
+    const char *kn[] = { "cybersecurity", "coding", "general" };
+    size_t off = 0;
+    off += snprintf(out + off, outsz - off,
+                    "[%s agent · tier %s]\n", kn[kind], TIER_NAME[tier]);
+    if (!is_command_safe(task) || !is_command_safe(cmd)) {
+        off += snprintf(out + off, outsz - off,
+                        "REFUSED by safety guard (sudo/destructive pattern).\n");
+        return off;
+    }
+    if (getenv("SLM_NO_EXEC")) {
+        off += snprintf(out + off, outsz - off, "[plan-only] would run:\n%s\n", cmd);
+        return off;
+    }
+    setenv("SLM_AGENT_CMD", cmd, 1);
+    char wrapped[160];
+    snprintf(wrapped, sizeof wrapped,
+        "command -v timeout >/dev/null && timeout %d sh -c 'eval \"$SLM_AGENT_CMD\"' "
+        "|| sh -c 'eval \"$SLM_AGENT_CMD\"'", TIER_TIMEOUT[tier]);
+    FILE *pp = popen(wrapped, "r");
+    if (!pp) { off += snprintf(out + off, outsz - off, "failed to launch shell\n"); return off; }
+    char line[512];
+    while (off < outsz - 1 && fgets(line, sizeof line, pp))
+        off += snprintf(out + off, outsz - off, "%s", line);
+    pclose(pp);
+    return off;
+}
+
+/* ================================================================== */
+/*  Web GUI — a tiny HTTP server in pure C (POSIX sockets, no deps).    */
+/*                                                                     */
+/*  Binds to 127.0.0.1 ONLY (localhost): the agent runs shell commands, */
+/*  so it must not be exposed to the network.  Serves a chat page and a */
+/*  /api endpoint that runs a task and returns the output.             */
+/* ================================================================== */
+static const char *GUI_HTML =
+"<!doctype html><html><head><meta charset=utf-8><title>Sentinel</title>"
+"<meta name=viewport content='width=device-width,initial-scale=1'>"
+"<style>body{background:#0a0f1f;color:#e6f6ff;font-family:ui-monospace,Menlo,Consolas,monospace;margin:0}"
+"header{padding:14px 18px;border-bottom:1px solid #18324a;color:#22d3ee;font-weight:700;font-size:20px}"
+"#log{padding:16px 18px;height:calc(100vh - 150px);overflow:auto;white-space:pre-wrap;font-size:13px}"
+".u{color:#34d399}.a{color:#cfe8ff}.s{color:#5b7a99}"
+"form{display:flex;gap:8px;padding:12px 18px;border-top:1px solid #18324a}"
+"input{flex:1;background:#0b1426;border:1px solid #18324a;color:#e6f6ff;padding:10px;border-radius:8px;font:inherit}"
+"button{background:#22d3ee;border:0;color:#04121c;padding:10px 16px;border-radius:8px;font-weight:700;cursor:pointer}"
+"</style></head><body>"
+"<header>\xe2\x97\x86 Sentinel \xc2\xb7 local AI agent</header>"
+"<div id=log><span class=s>Type a task (e.g. \"list files\", \"show me a cve about android\", "
+"\"write a C function to reverse a string\"). Runs locally on your machine.</span>\n\n</div>"
+"<form onsubmit=\"send();return false\"><input id=q autofocus placeholder='ask Sentinel...'>"
+"<button>Send</button></form>"
+"<script>"
+"var log=document.getElementById('q');var L=document.getElementById('log');"
+"function add(c,t){var s=document.createElement('span');s.className=c;s.textContent=t;L.appendChild(s);L.scrollTop=L.scrollHeight;}"
+"async function send(){var q=document.getElementById('q');var t=q.value.trim();if(!t)return;q.value='';"
+"add('u','\\u25b8 '+t+'\\n');add('s','running...\\n');"
+"try{var r=await fetch('/api',{method:'POST',body:t});var x=await r.text();"
+"L.lastChild.remove();add('a',x+'\\n\\n');}catch(e){L.lastChild.remove();add('s','error: '+e+'\\n');}}"
+"</script></body></html>";
+
+static volatile sig_atomic_t g_serve_stop = 0;
+static void on_sigint(int s) { (void)s; g_serve_stop = 1; }
+
+static void http_send(int c, const char *status, const char *ctype, const char *body, size_t blen) {
+    char hdr[256];
+    int hl = snprintf(hdr, sizeof hdr,
+        "HTTP/1.0 %s\r\nContent-Type: %s\r\nContent-Length: %zu\r\n"
+        "Connection: close\r\n\r\n", status, ctype, blen);
+    if (write(c, hdr, hl) < 0) return;
+    size_t off = 0;
+    while (off < blen) { ssize_t w = write(c, body + off, blen - off); if (w <= 0) break; off += w; }
+}
+
+static int serve_http(int port) {
+    signal(SIGINT, on_sigint);
+    signal(SIGPIPE, SIG_IGN);
+    int s = socket(AF_INET, SOCK_STREAM, 0);
+    if (s < 0) { perror("socket"); return 1; }
+    int one = 1; setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+    struct sockaddr_in a; memset(&a, 0, sizeof a);
+    a.sin_family = AF_INET;
+    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);   /* localhost ONLY */
+    a.sin_port = htons((unsigned short)port);
+    if (bind(s, (struct sockaddr *)&a, sizeof a) < 0) { perror("bind"); close(s); return 1; }
+    if (listen(s, 16) < 0) { perror("listen"); close(s); return 1; }
+    printf("Sentinel GUI on http://127.0.0.1:%d  (localhost only — Ctrl-C to stop)\n", port);
+    fflush(stdout);
+
+    static char req[8192], out[1 << 16];
+    while (!g_serve_stop) {
+        int c = accept(s, NULL, NULL);
+        if (c < 0) { if (g_serve_stop) break; continue; }
+        ssize_t n = read(c, req, sizeof req - 1);
+        if (n <= 0) { close(c); continue; }
+        req[n] = '\0';
+        if (strncmp(req, "POST /api", 9) == 0) {
+            char *body = strstr(req, "\r\n\r\n");
+            body = body ? body + 4 : (char *)"";
+            size_t blen = run_task_capture(body, out, sizeof out);
+            http_send(c, "200 OK", "text/plain; charset=utf-8", out, blen);
+        } else {
+            http_send(c, "200 OK", "text/html; charset=utf-8", GUI_HTML, strlen(GUI_HTML));
+        }
+        close(c);
+    }
+    close(s);
+    printf("\nGUI stopped.\n");
+    return 0;
+}
+
+/* ================================================================== */
+/*  TUI — an ANSI-styled interactive terminal interface (no ncurses).  */
+/* ================================================================== */
+static void run_tui(const char *selfexe, int params) {
+    printf("\033[2J\033[H");                       /* clear screen, home */
+    printf("\033[36m");
+    printf("  ╔══════════════════════════════════════════════════════════╗\n");
+    printf("  ║   ◆  S E N T I N E L   ·   local deep-GRU AI agent        ║\n");
+    printf("  ╚══════════════════════════════════════════════════════════╝\033[0m\n");
+    printf("  \033[90m%d params · Adam · fork-spawned sub-agents · 100%% local\033[0m\n\n", params);
+    printf("  \033[90mTASK: <x> | FANOUT: <n> <x> | \"show me a cve about <x>\" | /quit\033[0m\n\n");
+    fflush(stdout);
+
+    char line[4096];
+    int spawned = 0;
+    for (;;) {
+        printf("\033[32m sentinel \033[36m\xe2\x9d\xaf\033[0m ");   /* green/cyan prompt */
+        fflush(stdout);
+        if (!fgets(line, sizeof line, stdin)) break;
+        size_t len = strlen(line);
+        while (len && (line[len-1] == '\n' || line[len-1] == '\r')) line[--len] = '\0';
+        if (len == 0) continue;
+        if (strcmp(line, "/quit") == 0 || strcmp(line, "/exit") == 0) break;
+
+        char low[256]; size_t ln = len < sizeof low - 1 ? len : sizeof low - 1;
+        for (size_t i = 0; i < ln; i++) low[i] = (char)tolower((unsigned char)line[i]);
+        low[ln] = '\0';
+        char *fan = strstr(line, "FANOUT:");
+        char *trig = strstr(line, "TASK:");
+        int cve = (!fan && !trig) && (strstr(low, "cve") || strstr(low, "vuln"));
+
+        printf("\033[90m  ┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\033[0m\n");
+        if (fan) {
+            char *p = fan + 7;
+            while (*p == ' ') p++;
+            int count = atoi(p);
+            while (*p && *p != ' ') p++;
+            while (*p == ' ') p++;
+            int tier = estimate_difficulty(p);
+            printf("  \033[36mfan-out %d agents (tier %s)\033[0m\n", count, TIER_NAME[tier]);
+            spawned += spawn_batch(selfexe, p, count, tier);
+        } else {
+            char *task = trig ? trig + 5 : line; while (*task == ' ') task++;
+            int tier = estimate_difficulty(task);
+            printf("  \033[36m▸ %s  \033[90m(tier %s)\033[0m\n", task, TIER_NAME[tier]);
+            spawn_agent_tier(selfexe, task, tier);
+            spawned++;
+            (void)cve;
+        }
+        printf("\n");
+    }
+    printf("\n  \033[90m%d sub-agents this session. bye.\033[0m\n", spawned);
+}
+
 /* ================================================================== */
 /*  Data consolidation                                                 */
 /*                                                                     */
@@ -950,6 +1167,8 @@ static void print_usage(const char *prog) {
 "                            sample, then enter the interactive AI loop\n"
 "  %s --train <path...>    consolidate files/dirs into a corpus and train on it\n"
 "  %s --agent \"<task>\"     run once as a single sub-agent for <task>\n"
+"  %s --tui                styled terminal UI (interactive agent console)\n"
+"  %s --serve [port]       web GUI on http://127.0.0.1:8080 (localhost only)\n"
 "  %s --help | -h          show this help\n"
 "  %s --version            print version\n"
 "\n"
@@ -980,7 +1199,7 @@ static void print_usage(const char *prog) {
 "  Sub-agents run real shell commands but a hard guard refuses 'sudo' and\n"
 "  destructive patterns (rm -rf /, mkfs, dd, fork bombs, shutdown, ...).\n"
 "  Set SLM_NO_EXEC=1 to disable command execution entirely.\n",
-        VERSION, prog, prog, prog, prog, prog, prog);
+        VERSION, prog, prog, prog, prog, prog, prog, prog, prog);
 }
 
 int main(int argc, char **argv) {
@@ -1002,6 +1221,17 @@ int main(int argc, char **argv) {
         return run_agent(atoi(argv[2]), argv[3]);
     if (argc == 3 && strcmp(argv[1], "--agent") == 0)
         return run_agent(1, argv[2]);
+
+    /* ---- GUI / TUI agent consoles (don't allocate the big LM weights) ---- */
+    if (argc >= 2 && strcmp(argv[1], "--serve") == 0)
+        return serve_http(argc >= 3 ? atoi(argv[2]) : 8080);
+    if (argc >= 2 && strcmp(argv[1], "--tui") == 0) {
+        char selfexe[PATH_MAX]; self_path(selfexe, sizeof selfexe, argv[0]);
+        int params = (int)(VOCAB*EMBED + NUM_LAYERS*NGATE*(2*HIDDEN*HIDDEN + HIDDEN)
+                           + VOCAB*HIDDEN + VOCAB);
+        run_tui(selfexe, params);
+        return 0;
+    }
 
     srand(1234567u);
     init_weights();
