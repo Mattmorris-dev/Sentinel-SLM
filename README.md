@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/sentinel-logo.svg" alt="Sentinel" width="560">
+</p>
+
 # Sentinel — a self-contained deep RNN agent in pure C
 
 A fully self-contained Small Language Model written in standard C with **no
