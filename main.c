@@ -61,7 +61,7 @@
 #define EMBED       128     /* learned embedding dimension              */
 #endif
 #ifndef HIDDEN
-#define HIDDEN      1664    /* hidden units per GRU layer               */
+#define HIDDEN      1792    /* hidden units per GRU layer               */
 #endif
 #ifndef NUM_LAYERS
 #define NUM_LAYERS  3       /* stacked GRU layers (depth)               */
@@ -74,13 +74,13 @@
 #define ADAM_B1     0.9     /* Adam first-moment decay                  */
 #define ADAM_B2     0.999   /* Adam second-moment decay                 */
 #define ADAM_EPS    1e-8    /* Adam epsilon                             */
-/* ~50M parameters and ~1.6 GB RAM at these defaults — and crucially this is
- * UNDER the 2 GB static-data limit, so it builds with plain gcc (no
- * -mcmodel=large) and runs on any machine with ~2 GB RAM. With the Adam
- * optimizer each weight carries two moment estimates, so memory is ~32
- * bytes/param (weight + gradient + m + v, all double):
- *   58M params ~= 1.87 GB = the practical ceiling for plain gcc.
- *   Past ~2 GB of arrays you must add -mcmodel=large (see 'make huge').
+/* ~58M parameters and ~1.85 GB RAM at these defaults — this is the MAX that
+ * still fits under the 2 GB static-data limit, so it builds with plain gcc
+ * (no -mcmodel=large). Comfortable on a 4 GB+ machine; tight on exactly 2 GB.
+ * With Adam each weight carries two moment estimates, so memory is ~32
+ * bytes/param (weight + gradient + m + v, all double).
+ *   Past ~58M params you cross 2 GB and must add -mcmodel=large (see 'make
+ *   huge' for the 101M model). Lower HIDDEN if you want more RAM headroom.
  * RAM is not the wall; CPU is: training is O(NUM_LAYERS * HIDDEN^2 * SEQ_LEN)
  * per step (~4 billion mults/step here), so a real train at this size takes
  * hours on a Pi — train on a faster box and copy sentinel.bin, or run
