@@ -31,7 +31,7 @@ fully local pipeline.
 ## Build
 
 ```sh
-gcc -O2 -Wall -mcmodel=large -o sentinel main.c -lm
+gcc -O2 -Wall -o sentinel main.c -lm
 ```
 
 …or use the Makefile:

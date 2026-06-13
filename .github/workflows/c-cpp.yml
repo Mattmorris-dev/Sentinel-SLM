@@ -19,7 +19,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Compile (warnings as errors)
-        run: gcc -O2 -Wall -Wextra -Werror -mcmodel=large -o sentinel main.c -lm
+        run: gcc -O2 -Wall -Wextra -Werror -o sentinel main.c -lm
 
       - name: Smoke test — help, version, agent + safety guard
         run: |

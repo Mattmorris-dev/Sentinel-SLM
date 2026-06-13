@@ -2,28 +2,33 @@
 # Free software (Apache-2.0). No external ML libraries; only libc + libm.
 
 CC      ?= gcc
-# -mcmodel=large is required because the default model uses >2 GB of static
-# arrays (it overflows the small code model's 32-bit relocations otherwise).
-CFLAGS  ?= -O2 -Wall -mcmodel=large
+# The default ~50M-param model uses <2 GB of static arrays, so it builds with
+# plain gcc and runs anywhere. (The 'huge' target adds -mcmodel=large for the
+# 101M model, whose arrays exceed the 2 GB small-code-model limit.)
+CFLAGS  ?= -O2 -Wall
 LDLIBS   = -lm
 BIN      = sentinel
 PREFIX  ?= /usr/local
 VERSION ?= 0.3.0
 
-.PHONY: all both slm run train fetch quick-fetch clean distclean install uninstall package help
+.PHONY: all both slm huge run train fetch quick-fetch clean distclean install uninstall package help
 
-all: $(BIN)            ## build the big model (default)
+all: $(BIN)            ## build the default ~50M model (plain gcc, runs anywhere)
 
 $(BIN): main.c
 	$(CC) $(CFLAGS) -o $@ main.c $(LDLIBS)
 
-# A genuine small LM from the SAME source (~1.2M params, no -mcmodel=large).
-# Uses its own checkpoint so it can coexist with the big model.
-slm: main.c            ## build a small SLM (sentinel-slm, ~1.2M params)
+# A tiny SLM from the SAME source (~1.2M params, 27 MB). Runs on anything.
+slm: main.c            ## build a tiny SLM (sentinel-slm, ~1.2M params)
 	$(CC) -O2 -Wall -DHIDDEN=256 -DEMBED=64 -DNUM_LAYERS=2 \
 	    -DCKPT_PATH='"sentinel-slm.bin"' -o sentinel-slm main.c $(LDLIBS)
 
-both: $(BIN) slm       ## build BOTH the big model and the small SLM
+# The big model (~101M params, ~3.2 GB) — needs the large code model.
+huge: main.c           ## build the 101M model (sentinel-huge, needs 8 GB RAM)
+	$(CC) -O2 -Wall -mcmodel=large -DHIDDEN=2368 \
+	    -DCKPT_PATH='"sentinel-huge.bin"' -o sentinel-huge main.c $(LDLIBS)
+
+both: $(BIN) slm       ## build the default model + the tiny SLM
 
 run: $(BIN)            ## train on the built-in corpus, then serve the read/agent loop
 	./$(BIN)

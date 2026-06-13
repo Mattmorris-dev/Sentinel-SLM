@@ -25,7 +25,7 @@
  *   ./sentinel --agent "<t>"   run as a spawned sub-agent for task <t>.
  *   ./sentinel --train <file>  train extra epochs on an external corpus file.
  *
- * Build:  gcc -O2 -Wall -mcmodel=large -o sentinel main.c -lm
+ * Build:  gcc -O2 -Wall -o sentinel main.c -lm
  */
 
 #include <stdio.h>
@@ -61,7 +61,7 @@
 #define EMBED       128     /* learned embedding dimension              */
 #endif
 #ifndef HIDDEN
-#define HIDDEN      2368    /* hidden units per GRU layer               */
+#define HIDDEN      1664    /* hidden units per GRU layer               */
 #endif
 #ifndef NUM_LAYERS
 #define NUM_LAYERS  3       /* stacked GRU layers (depth)               */
@@ -74,10 +74,13 @@
 #define ADAM_B1     0.9     /* Adam first-moment decay                  */
 #define ADAM_B2     0.999   /* Adam second-moment decay                 */
 #define ADAM_EPS    1e-8    /* Adam epsilon                             */
-/* ~101M parameters and ~3.2 GB RAM at these defaults. With the Adam optimizer
- * each weight carries TWO moment estimates, so memory is ~32 bytes/param
- * (weight + gradient + m + v, all double):
- *   1.5 GB RAM ~= 47M params   3 GB RAM ~= 94M params (this default ~101M).
+/* ~50M parameters and ~1.6 GB RAM at these defaults — and crucially this is
+ * UNDER the 2 GB static-data limit, so it builds with plain gcc (no
+ * -mcmodel=large) and runs on any machine with ~2 GB RAM. With the Adam
+ * optimizer each weight carries two moment estimates, so memory is ~32
+ * bytes/param (weight + gradient + m + v, all double):
+ *   58M params ~= 1.87 GB = the practical ceiling for plain gcc.
+ *   Past ~2 GB of arrays you must add -mcmodel=large (see 'make huge').
  * RAM is not the wall; CPU is: training is O(NUM_LAYERS * HIDDEN^2 * SEQ_LEN)
  * per step (~4 billion mults/step here), so a real train at this size takes
  * hours on a Pi — train on a faster box and copy sentinel.bin, or run
