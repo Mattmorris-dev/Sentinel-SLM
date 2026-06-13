@@ -2,31 +2,51 @@
   <img src="assets/sentinel-logo.svg" alt="Sentinel" width="560">
 </p>
 
-# Sentinel — a self-contained deep GRU agent in pure C
+# Sentinel — your security analyst that never leaves the box
 
-A fully self-contained Small Language Model written in standard C with **no
-external machine-learning libraries** (only libc + libm). It implements, by hand:
+**A self-contained AI security agent in one C file. No cloud. No API keys. No vendor.
+No per-token bill.** It runs on a $50 Raspberry Pi, answers CVE / malware / OSINT
+questions from real data, and spawns its own sub-agents to do the work — entirely on
+your machine.
 
-- a **character-level tokenizer** (7-bit ASCII),
-- a **learned embedding table**,
-- a **stacked, multi-layer GRU** (gated recurrent unit) network with hidden-state
-  feedback, so it processes a continuous stream with **no fixed token-context window**,
-- a **manual matrix-multiply** (`matvec`) used for every layer at every timestep,
-- a real **backprop-through-time** trainer (cross-entropy loss, gradient clipping,
-  Adam) — full gradients through all three GRU gates,
-- **checkpoint persistence** + **online learning** so the network keeps growing its
-  skills across runs,
-- a **retrieval (RAG) agent**: ask `show me a cve / malware / osint about <x>` and it
-  greps the local corpus for real CVE / malware-analysis / OSINT facts — this is how
-  the small model stays small (knowledge lives in the corpus, not the weights), and
-- a **sub-agent layer**: when it reads a line containing the trigger `TASK:`, it
-  `fork()`/`exec()`s a separate process specialised in **cybersecurity / coding /
-  general** work, which runs a **safe** shell command and streams the result back.
+```sh
+git clone https://github.com/mattymomo1993/Sentinel && cd Sentinel
+make && ./start.sh
+```
 
-It's a genuine deep network (~101M parameters, ~3.2 GB RAM, at the default size): real
-weights, real gradients, real GRU backprop. At this scale it learns character/word
-statistics rather than fluent prose — the value is the complete, dependency-free,
-fully local pipeline.
+> Built for the people cloud AI shuts out: **air-gapped networks, incident responders,
+> privacy-first teams, home labs, classrooms.** You compile one file and own the binary
+> forever. (See [`PITCH.md`](PITCH.md) for the short version.)
+
+## What it does
+
+- 🛡️ **Answers security questions from real data.** Ask `show me a cve about log4j` or
+  `malware like emotet` and it greps a local corpus of **150k+ CVE writeups, malware-
+  analysis notes, and OSINT resources** — with optional **live internet** lookup for
+  fresh CVEs (`SLM_ONLINE=1`). Knowledge lives in the corpus (retrieval / RAG), which
+  is how the model stays small.
+- 🤖 **Spawns its own sub-agents.** `TASK:` forks a specialist worker
+  (cybersecurity / coding / general); `FANOUT: 100` runs up to a hundred at once, each
+  sized to the task's difficulty.
+- 🧠 **A real neural net, by hand.** A stacked **GRU** with backprop-through-time and
+  **Adam** — no libraries, just libc + libm — that keeps learning from what it reads.
+- 🔒 **Safe by default.** Every command is screened (no `sudo`, no destructive ops); the
+  web UI binds to localhost only; `SLM_NO_EXEC=1` makes it plan-only.
+- 🖥️ **However you like it.** Web GUI (`--serve`), terminal UI (`--tui`), plain CLI, or a
+  single sub-agent call.
+
+## Runs on what you've got — pick a size
+
+| Build | Params | RAM | Flag | Hardware |
+|---|---|---|---|---|
+| `make slm` | ~1.2M | 27 MB | none | a potato |
+| `make` (default) | ~58M | ~1.9 GB | none (plain gcc) | a Pi 4 / any laptop |
+| `make huge` | ~101M | ~3.2 GB | `-mcmodel=large` | an 8 GB Pi / a server |
+
+It's a genuine deep network with real weights, gradients, and GRU backprop — built by
+hand in standard C. It learns character/word statistics (not fluent prose); the power is
+the **complete, dependency-free, fully local pipeline**: tokenizer → embedding → stacked
+GRU → BPTT/Adam → checkpointing → retrieval → process-spawning agents.
 
 ## Build
 
