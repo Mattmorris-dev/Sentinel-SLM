@@ -1,0 +1,7 @@
+# Build artifacts and model checkpoints (regenerated locally)
+local_slm
+*.bin
+local_slm.bin
+
+# Sub-agent scratch files
+/tmp/slm_agent_snippet*
