@@ -469,6 +469,40 @@ static int classify_task(const char *task) {
  * Returns the classification used.  For coding tasks it may first emit a
  * small C snippet to /tmp via plain C file I/O, then compile + run it.
  */
+/*
+ * Pull safe search keywords out of a task string: alphanumeric tokens of
+ * length >= 4 that aren't common stop-words, joined by '|' into a grep -E
+ * alternation. Only [A-Za-z0-9|] ever reaches the shell, so this can't be
+ * used for command injection.
+ */
+static void extract_keywords(const char *task, char *out, size_t outsz) {
+    static const char *stop[] = {
+        "show","find","that","this","with","from","what","which","your","you",
+        "might","right","there","here","about","please","could","would","some",
+        "look","give","tell","need","want","have","does","into","them","they",
+        "cve","cves","vuln","vulnerability","vulnerabilities", NULL };
+    char tok[64];
+    size_t oi = 0; int first = 1;
+    const char *p = task;
+    while (*p && oi + 2 < outsz) {
+        while (*p && !isalnum((unsigned char)*p)) p++;
+        size_t ti = 0;
+        while (*p && isalnum((unsigned char)*p) && ti < sizeof tok - 1)
+            tok[ti++] = (char)tolower((unsigned char)*p++);
+        tok[ti] = '\0';
+        if (ti < 4) continue;
+        int skip = 0;
+        for (int i = 0; stop[i]; i++) if (strcmp(tok, stop[i]) == 0) { skip = 1; break; }
+        if (skip) continue;
+        if (!first && oi + 1 < outsz) out[oi++] = '|';
+        for (size_t i = 0; i < ti && oi + 1 < outsz; i++) out[oi++] = tok[i];
+        first = 0;
+    }
+    out[oi] = '\0';
+    if (oi == 0)   /* nothing useful -> default to mobile/common terms */
+        snprintf(out, outsz, "android|ios|mobile|bluetooth|wifi|kernel|webkit");
+}
+
 static int build_command(const char *task, char *cmd, size_t cmdsz) {
     int kind = classify_task(task);
     char low[512];
@@ -476,6 +510,26 @@ static int build_command(const char *task, char *cmd, size_t cmdsz) {
     if (n >= sizeof low) n = sizeof low - 1;
     for (size_t i = 0; i < n; i++) low[i] = (char)tolower((unsigned char)task[i]);
     low[n] = '\0';
+
+    /* CVE / vulnerability lookup: search the fetched corpus and show real hits. */
+    if (strstr(low, "cve") || strstr(low, "vuln")) {
+        char kw[256];
+        extract_keywords(task, kw, sizeof kw);
+        snprintf(cmd, cmdsz,
+            "dir=corpus; [ -d \"$dir\" ] || dir=.; "
+            "echo '[cve agent] searching '\"$dir\"' for: %s'; "
+            "hits=$(grep -rIl -i -E '%s' \"$dir\" --include='*.md' 2>/dev/null | head -3); "
+            "if [ -z \"$hits\" ]; then "
+            "echo 'no keyword match — showing a sample real CVE from the corpus:'; "
+            "hits=$(grep -rIl -E 'CVE-[0-9]{4}-[0-9]+' \"$dir\" --include='*.md' 2>/dev/null | head -1); fi; "
+            "if [ -z \"$hits\" ]; then "
+            "echo 'no CVE writeups in corpus — run ./fetch_corpus.sh (recent years) first'; "
+            "else for f in $hits; do echo \"=== $f ===\"; "
+            "grep -i -m1 -E 'CVE-[0-9]{4}-[0-9]+' \"$f\"; "
+            "sed -n '/### Description/,/###/p' \"$f\" | sed '1d;$d' | head -8; echo; done; fi",
+            kw, kw);
+        return 0;  /* report as cyber specialism */
+    }
 
     if (strstr(low, "list") && (strstr(low, "file") || strstr(low, "dir"))) {
         snprintf(cmd, cmdsz, "ls -la");
@@ -760,8 +814,14 @@ int main(int argc, char **argv) {
         if (len == 0) continue;
 
         char *trig = strstr(line, "TASK:");
-        if (trig) {
-            char *task = trig + 5;
+        /* also treat a plain CVE/vuln question as a lookup, no "TASK:" needed */
+        char low[256]; size_t ln = len < sizeof low - 1 ? len : sizeof low - 1;
+        for (size_t i = 0; i < ln; i++) low[i] = (char)tolower((unsigned char)line[i]);
+        low[ln] = '\0';
+        int is_cve_q = (!trig) && (strstr(low, "cve") || strstr(low, "vuln"));
+
+        if (trig || is_cve_q) {
+            char *task = trig ? trig + 5 : line;
             while (*task == ' ') task++;
             printf("[trigger detected] spawning sub-agent for: \"%s\"\n", task);
             fflush(stdout);
