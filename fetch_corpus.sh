@@ -24,6 +24,11 @@ set -uo pipefail
 OUT="${1:-corpus}"
 DEPTH=1
 CVE_YEARS="${CVE_YEARS:-2024 2025}"     # which CVE years to sparse-checkout
+# CVE_YEARS is word-split into git arguments, so allow only digits/spaces.
+if ! printf '%s' "$CVE_YEARS" | grep -qE '^[0-9 ]+$'; then
+  echo "error: CVE_YEARS must be space-separated years (digits only)." >&2
+  exit 1
+fi
 mkdir -p "$OUT"
 
 # --- curated, editable source lists -------------------------------------
@@ -56,6 +61,11 @@ fi
 # --- helpers ------------------------------------------------------------
 clone_repo() {
   local repo="$1" dest
+  # validate owner/name so a crafted list entry can't traverse paths or
+  # inject git arguments
+  if ! printf '%s' "$repo" | grep -qE '^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$'; then
+    echo "  ! skip (invalid repo name)  $repo"; return
+  fi
   dest="$OUT/$(echo "$repo" | tr '/.' '__')"
   if [ -d "$dest" ]; then echo "  skip (exists)  $repo"; return; fi
   echo "  cloning  $repo"

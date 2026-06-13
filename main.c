@@ -2,7 +2,7 @@
  * Sentinel  —  a fully self-contained Small Language Model in standard C.
  *
  * No external machine-learning libraries.  Everything below — the tokenizer,
- * the embedding table, the stacked recurrent layers, the matrix multiply, the
+ * the embedding table, the stacked GRU layers, the matrix multiply, the
  * backprop-through-time trainer, the checkpoint format and the process-spawning
  * sub-agent layer — is implemented by hand using only the C standard library
  * (plus libm for tanh/exp/sqrt/log).
@@ -47,40 +47,54 @@
 /*  recompiling is all that's needed to deepen / widen the model.      */
 /* ------------------------------------------------------------------ */
 #define VOCAB       128     /* character-level tokenizer: 7-bit ASCII   */
-#define EMBED       64      /* learned embedding dimension              */
-#define HIDDEN      192     /* hidden units per recurrent layer         */
-#define NUM_LAYERS  3       /* stacked recurrent layers (depth)         */
+#define EMBED       96      /* learned embedding dimension              */
+#define HIDDEN      384     /* hidden units per GRU layer               */
+#define NUM_LAYERS  3       /* stacked GRU layers (depth)               */
 #define SEQ_LEN     32      /* BPTT unroll length                       */
 #define LR          0.10    /* base learning rate (Adagrad)             */
 #define CLIP        5.0     /* gradient clipping bound                  */
+/* ~2.7M parameters and ~200 MB RAM at these defaults. This is about the
+ * sweet spot for CPU training. Lower HIDDEN/NUM_LAYERS if training is too
+ * slow on a small machine (e.g. a Raspberry Pi Zero); raise them for more
+ * capacity on a server. The realistic "subscription" deployment is: train
+ * the big model once on a fast box, ship the resulting sentinel.bin, and let
+ * users run inference. The code is dimension-generic either way. */
 
-#define CKPT_MAGIC  0x534C4D31u   /* "SLM1" */
+#define CKPT_MAGIC  0x534C4D32u   /* "SLM2" — GRU checkpoint format */
 #define CKPT_PATH   "sentinel.bin"
-#define VERSION     "0.1.0"
+#define VERSION     "0.2.0"
 
 /* ------------------------------------------------------------------ */
-/*  Parameters (static weight matrices) + Adagrad memory + gradients.  */
+/*  Parameters — a stacked GRU (gated recurrent unit) network.         */
+/*                                                                     */
+/*  Each layer has three gates: z (update), r (reset), n (candidate).  */
+/*  Per gate there is an input weight Wg, a recurrent weight Ug and a   */
+/*  bias bg.  Gates let the layer keep or forget hidden state, which    */
+/*  fixes the vanishing-gradient problem of a plain tanh RNN and lets   */
+/*  depth + long sequences actually help.                              */
 /*  EMBED <= HIDDEN, so layer-0 input is zero-padded up to HIDDEN and   */
-/*  every weight matrix can share a uniform HIDDEN-wide stride.         */
+/*  every weight matrix shares a uniform HIDDEN-wide stride.            */
 /* ------------------------------------------------------------------ */
-static double Wemb[VOCAB][EMBED];                 /* embedding table      */
-static double Wxh [NUM_LAYERS][HIDDEN][HIDDEN];   /* input  -> hidden     */
-static double Whh [NUM_LAYERS][HIDDEN][HIDDEN];   /* hidden -> hidden     */
-static double bh  [NUM_LAYERS][HIDDEN];           /* hidden bias          */
-static double Why [VOCAB][HIDDEN];                 /* hidden -> output     */
-static double by  [VOCAB];                         /* output bias          */
+enum { GZ = 0, GR = 1, GN = 2, NGATE = 3 };       /* update / reset / candidate */
+
+static double Wemb[VOCAB][EMBED];                          /* embedding table */
+static double Wg  [NUM_LAYERS][NGATE][HIDDEN][HIDDEN];     /* input  -> gate  */
+static double Ug  [NUM_LAYERS][NGATE][HIDDEN][HIDDEN];     /* hidden -> gate  */
+static double bg  [NUM_LAYERS][NGATE][HIDDEN];             /* gate bias       */
+static double Why [VOCAB][HIDDEN];                          /* hidden -> output*/
+static double by  [VOCAB];                                  /* output bias     */
 
 static double dWemb[VOCAB][EMBED];
-static double dWxh [NUM_LAYERS][HIDDEN][HIDDEN];
-static double dWhh [NUM_LAYERS][HIDDEN][HIDDEN];
-static double dbh  [NUM_LAYERS][HIDDEN];
+static double dWg  [NUM_LAYERS][NGATE][HIDDEN][HIDDEN];
+static double dUg  [NUM_LAYERS][NGATE][HIDDEN][HIDDEN];
+static double dbg  [NUM_LAYERS][NGATE][HIDDEN];
 static double dWhy [VOCAB][HIDDEN];
 static double dby  [VOCAB];
 
 static double mWemb[VOCAB][EMBED];
-static double mWxh [NUM_LAYERS][HIDDEN][HIDDEN];
-static double mWhh [NUM_LAYERS][HIDDEN][HIDDEN];
-static double mbh  [NUM_LAYERS][HIDDEN];
+static double mWg  [NUM_LAYERS][NGATE][HIDDEN][HIDDEN];
+static double mUg  [NUM_LAYERS][NGATE][HIDDEN][HIDDEN];
+static double mbg  [NUM_LAYERS][NGATE][HIDDEN];
 static double mWhy [VOCAB][HIDDEN];
 static double mby  [VOCAB];
 
@@ -88,6 +102,10 @@ static double mby  [VOCAB];
 static int    g_in [SEQ_LEN];
 static double g_emb[SEQ_LEN][EMBED];
 static double g_h  [NUM_LAYERS][SEQ_LEN + 1][HIDDEN];  /* [l][0] = carried state */
+static double g_z  [NUM_LAYERS][SEQ_LEN][HIDDEN];      /* update gate           */
+static double g_r  [NUM_LAYERS][SEQ_LEN][HIDDEN];      /* reset  gate           */
+static double g_n  [NUM_LAYERS][SEQ_LEN][HIDDEN];      /* candidate state       */
+static double g_hr [NUM_LAYERS][SEQ_LEN][HIDDEN];      /* r (.) h_prev          */
 static double g_y  [SEQ_LEN][VOCAB];
 static double g_p  [SEQ_LEN][VOCAB];
 
@@ -129,29 +147,41 @@ static void softmax(double *p, const double *x, int n) {
     for (int i = 0; i < n; i++) p[i] *= inv;
 }
 
+/* Logistic sigmoid, used by the GRU update/reset gates.  Branch on sign so a
+ * large-magnitude input never overflows exp() (avoids a spurious FP flag). */
+static double sigmoid(double x) {
+    if (x >= 0.0) return 1.0 / (1.0 + exp(-x));
+    double e = exp(x);
+    return e / (1.0 + e);
+}
+
 /* ------------------------------------------------------------------ */
 /*  Weight initialisation (fixed seed -> reproducible static weights). */
 /* ------------------------------------------------------------------ */
 static void init_weights(void) {
     rng_state = 0x9E3779B97F4A7C15ULL;
+    /* Xavier-ish scale keeps gate pre-activations sane at this width. */
+    double s = 1.0 / sqrt((double)HIDDEN);
     for (int t = 0; t < VOCAB; t++)
         for (int j = 0; j < EMBED; j++)
             Wemb[t][j] = rnd_uniform(-0.1, 0.1);
     for (int l = 0; l < NUM_LAYERS; l++) {
-        for (int i = 0; i < HIDDEN; i++) {
-            for (int j = 0; j < HIDDEN; j++) {
-                Wxh[l][i][j] = rnd_uniform(-0.1, 0.1);
-                Whh[l][i][j] = rnd_uniform(-0.1, 0.1);
+        for (int gt = 0; gt < NGATE; gt++) {
+            for (int i = 0; i < HIDDEN; i++) {
+                for (int j = 0; j < HIDDEN; j++) {
+                    Wg[l][gt][i][j] = rnd_uniform(-s, s);
+                    Ug[l][gt][i][j] = rnd_uniform(-s, s);
+                }
+                bg[l][gt][i] = 0.0;
             }
-            bh[l][i] = 0.0;
         }
     }
     for (int i = 0; i < VOCAB; i++) {
         for (int j = 0; j < HIDDEN; j++) Why[i][j] = rnd_uniform(-0.1, 0.1);
         by[i] = 0.0;
     }
-    memset(mWemb, 0, sizeof mWemb); memset(mWxh, 0, sizeof mWxh);
-    memset(mWhh, 0, sizeof mWhh);   memset(mbh, 0, sizeof mbh);
+    memset(mWemb, 0, sizeof mWemb); memset(mWg, 0, sizeof mWg);
+    memset(mUg, 0, sizeof mUg);     memset(mbg, 0, sizeof mbg);
     memset(mWhy, 0, sizeof mWhy);   memset(mby, 0, sizeof mby);
 }
 
@@ -169,6 +199,29 @@ static void adagrad(double *p, double *g, double *m, int n) {
     }
 }
 
+/* Backprop one GRU gate: accumulate dWg/dUg/dbg, add input grad into dxin,
+ * and return the recurrent grad drec = Ug^T * d (gradient w.r.t. the gate's
+ * recurrent input vector). */
+static void gate_backward(int l, int gt, const double *d, const double *xin,
+                          const double *rec, double *dxin, double *drec) {
+    for (int i = 0; i < HIDDEN; i++) {
+        double di = d[i];
+        dbg[l][gt][i] += di;
+        double *wr = &dWg[l][gt][i][0];
+        double *ur = &dUg[l][gt][i][0];
+        for (int j = 0; j < HIDDEN; j++) { wr[j] += di * xin[j]; ur[j] += di * rec[j]; }
+    }
+    for (int j = 0; j < HIDDEN; j++) {
+        double sx = 0.0, sr = 0.0;
+        for (int i = 0; i < HIDDEN; i++) {
+            sx += Wg[l][gt][i][j] * d[i];
+            sr += Ug[l][gt][i][j] * d[i];
+        }
+        dxin[j] += sx;
+        drec[j]  = sr;
+    }
+}
+
 static double train_step(const int *inputs, const int *targets,
                          double hprev[NUM_LAYERS][HIDDEN]) {
     /* ---- forward ---- */
@@ -176,23 +229,40 @@ static double train_step(const int *inputs, const int *targets,
         for (int i = 0; i < HIDDEN; i++) g_h[l][0][i] = hprev[l][i];
 
     double loss = 0.0;
-    double a[HIDDEN], b[HIDDEN], xin[HIDDEN];
+    double xin[HIDDEN], wx[HIDDEN], uh[HIDDEN];
     for (int t = 0; t < SEQ_LEN; t++) {
         int tok = inputs[t];
         g_in[t] = tok;
         for (int j = 0; j < EMBED; j++) g_emb[t][j] = Wemb[tok][j];
 
         for (int l = 0; l < NUM_LAYERS; l++) {
+            const double *hp = g_h[l][t];
             if (l == 0) {
                 for (int j = 0; j < EMBED;  j++) xin[j] = g_emb[t][j];
                 for (int j = EMBED; j < HIDDEN; j++) xin[j] = 0.0;
             } else {
                 for (int j = 0; j < HIDDEN; j++) xin[j] = g_h[l - 1][t + 1][j];
             }
-            matvec(a, &Wxh[l][0][0], xin,            HIDDEN, HIDDEN);
-            matvec(b, &Whh[l][0][0], g_h[l][t],       HIDDEN, HIDDEN);
+            /* update gate z */
+            matvec(wx, &Wg[l][GZ][0][0], xin, HIDDEN, HIDDEN);
+            matvec(uh, &Ug[l][GZ][0][0], hp,  HIDDEN, HIDDEN);
             for (int i = 0; i < HIDDEN; i++)
-                g_h[l][t + 1][i] = tanh(a[i] + b[i] + bh[l][i]);
+                g_z[l][t][i] = sigmoid(wx[i] + uh[i] + bg[l][GZ][i]);
+            /* reset gate r */
+            matvec(wx, &Wg[l][GR][0][0], xin, HIDDEN, HIDDEN);
+            matvec(uh, &Ug[l][GR][0][0], hp,  HIDDEN, HIDDEN);
+            for (int i = 0; i < HIDDEN; i++)
+                g_r[l][t][i] = sigmoid(wx[i] + uh[i] + bg[l][GR][i]);
+            /* candidate n with reset-gated hidden: hr = r (.) h_prev */
+            for (int i = 0; i < HIDDEN; i++) g_hr[l][t][i] = g_r[l][t][i] * hp[i];
+            matvec(wx, &Wg[l][GN][0][0], xin,        HIDDEN, HIDDEN);
+            matvec(uh, &Ug[l][GN][0][0], g_hr[l][t], HIDDEN, HIDDEN);
+            for (int i = 0; i < HIDDEN; i++)
+                g_n[l][t][i] = tanh(wx[i] + uh[i] + bg[l][GN][i]);
+            /* new hidden: h = (1 - z) (.) n + z (.) h_prev */
+            for (int i = 0; i < HIDDEN; i++)
+                g_h[l][t + 1][i] = (1.0 - g_z[l][t][i]) * g_n[l][t][i]
+                                   + g_z[l][t][i] * hp[i];
         }
         matvec(g_y[t], &Why[0][0], g_h[NUM_LAYERS - 1][t + 1], VOCAB, HIDDEN);
         for (int i = 0; i < VOCAB; i++) g_y[t][i] += by[i];
@@ -201,8 +271,8 @@ static double train_step(const int *inputs, const int *targets,
     }
 
     /* ---- backward (through depth and time) ---- */
-    memset(dWemb, 0, sizeof dWemb); memset(dWxh, 0, sizeof dWxh);
-    memset(dWhh, 0, sizeof dWhh);   memset(dbh, 0, sizeof dbh);
+    memset(dWemb, 0, sizeof dWemb); memset(dWg, 0, sizeof dWg);
+    memset(dUg, 0, sizeof dUg);     memset(dbg, 0, sizeof dbg);
     memset(dWhy, 0, sizeof dWhy);   memset(dby, 0, sizeof dby);
 
     double dh_next[NUM_LAYERS][HIDDEN];
@@ -215,8 +285,10 @@ static double train_step(const int *inputs, const int *targets,
 
         const double *top = g_h[NUM_LAYERS - 1][t + 1];
         for (int i = 0; i < VOCAB; i++) {
-            dby[i] += dy[i];
-            for (int j = 0; j < HIDDEN; j++) dWhy[i][j] += dy[i] * top[j];
+            double dyi = dy[i];
+            dby[i] += dyi;
+            double *wr = &dWhy[i][0];
+            for (int j = 0; j < HIDDEN; j++) wr[j] += dyi * top[j];
         }
 
         double dhtot[NUM_LAYERS][HIDDEN];
@@ -229,42 +301,47 @@ static double train_step(const int *inputs, const int *targets,
         }
 
         for (int l = NUM_LAYERS - 1; l >= 0; l--) {
-            double dtanh[HIDDEN];
-            for (int i = 0; i < HIDDEN; i++) {
-                double h = g_h[l][t + 1][i];
-                dtanh[i] = dhtot[l][i] * (1.0 - h * h);
-                dbh[l][i] += dtanh[i];
-            }
-            for (int i = 0; i < HIDDEN; i++) {
-                double dti = dtanh[i];
-                for (int k = 0; k < HIDDEN; k++)
-                    dWhh[l][i][k] += dti * g_h[l][t][k];
-            }
-            /* gradient to previous time, same layer (temporal) */
-            for (int k = 0; k < HIDDEN; k++) {
-                double s = 0.0;
-                for (int i = 0; i < HIDDEN; i++) s += Whh[l][i][k] * dtanh[i];
-                dh_next[l][k] = s;
-            }
-            /* layer input (xin) for this t */
+            const double *hp = g_h[l][t];
+            const double *z  = g_z[l][t];
+            const double *r  = g_r[l][t];
+            const double *nn = g_n[l][t];
+            const double *hr = g_hr[l][t];
+            double *dh = dhtot[l];
+
             if (l == 0) {
                 for (int j = 0; j < EMBED;  j++) xin[j] = g_emb[t][j];
                 for (int j = EMBED; j < HIDDEN; j++) xin[j] = 0.0;
             } else {
                 for (int j = 0; j < HIDDEN; j++) xin[j] = g_h[l - 1][t + 1][j];
             }
+
+            double dn[HIDDEN], dz[HIDDEN], dhp[HIDDEN];
+            double dan[HIDDEN], daz[HIDDEN], dar[HIDDEN], dr[HIDDEN];
+            double dxin[HIDDEN], drec[HIDDEN];
             for (int i = 0; i < HIDDEN; i++) {
-                double dti = dtanh[i];
-                for (int j = 0; j < HIDDEN; j++)
-                    dWxh[l][i][j] += dti * xin[j];
+                dn[i]   = dh[i] * (1.0 - z[i]);
+                dz[i]   = dh[i] * (hp[i] - nn[i]);
+                dhp[i]  = dh[i] * z[i];          /* direct h_prev path */
+                dxin[i] = 0.0;
             }
-            /* gradient to the layer input */
-            double dxin[HIDDEN];
-            for (int j = 0; j < HIDDEN; j++) {
-                double s = 0.0;
-                for (int i = 0; i < HIDDEN; i++) s += Wxh[l][i][j] * dtanh[i];
-                dxin[j] = s;
+            /* candidate n = tanh(Wn x + Un hr + bn) */
+            for (int i = 0; i < HIDDEN; i++) dan[i] = dn[i] * (1.0 - nn[i] * nn[i]);
+            gate_backward(l, GN, dan, xin, hr, dxin, drec);   /* drec = grad wrt hr */
+            for (int i = 0; i < HIDDEN; i++) {
+                dr[i]   = drec[i] * hp[i];       /* hr = r (.) h_prev */
+                dhp[i] += drec[i] * r[i];
             }
+            /* update gate z = sigmoid(...) */
+            for (int i = 0; i < HIDDEN; i++) daz[i] = dz[i] * z[i] * (1.0 - z[i]);
+            gate_backward(l, GZ, daz, xin, hp, dxin, drec);
+            for (int i = 0; i < HIDDEN; i++) dhp[i] += drec[i];
+            /* reset gate r = sigmoid(...) */
+            for (int i = 0; i < HIDDEN; i++) dar[i] = dr[i] * r[i] * (1.0 - r[i]);
+            gate_backward(l, GR, dar, xin, hp, dxin, drec);
+            for (int i = 0; i < HIDDEN; i++) dhp[i] += drec[i];
+
+            /* temporal gradient for t-1, and route the input gradient down */
+            for (int i = 0; i < HIDDEN; i++) dh_next[l][i] = dhp[i];
             if (l == 0) {
                 int tok = g_in[t];
                 for (int j = 0; j < EMBED; j++) dWemb[tok][j] += dxin[j];
@@ -279,9 +356,9 @@ static double train_step(const int *inputs, const int *targets,
     adagrad(&Why[0][0],  &dWhy[0][0],  &mWhy[0][0],  VOCAB * HIDDEN);
     adagrad(by, dby, mby, VOCAB);
     for (int l = 0; l < NUM_LAYERS; l++) {
-        adagrad(&Wxh[l][0][0], &dWxh[l][0][0], &mWxh[l][0][0], HIDDEN * HIDDEN);
-        adagrad(&Whh[l][0][0], &dWhh[l][0][0], &mWhh[l][0][0], HIDDEN * HIDDEN);
-        adagrad(bh[l], dbh[l], mbh[l], HIDDEN);
+        adagrad(&Wg[l][0][0][0], &dWg[l][0][0][0], &mWg[l][0][0][0], NGATE * HIDDEN * HIDDEN);
+        adagrad(&Ug[l][0][0][0], &dUg[l][0][0][0], &mUg[l][0][0][0], NGATE * HIDDEN * HIDDEN);
+        adagrad(&bg[l][0][0],    &dbg[l][0][0],    &mbg[l][0][0],    NGATE * HIDDEN);
     }
 
     /* carry the last hidden state forward (continuous, no context limit) */
@@ -320,25 +397,37 @@ static void train(const char *data, int data_len, int iters, int verbose) {
 /*  Generate text by sampling the model character by character.        */
 /* ------------------------------------------------------------------ */
 static void sample(int seed, int n) {
-    double h[NUM_LAYERS][HIDDEN];
+    double h[NUM_LAYERS][HIDDEN], hnew[NUM_LAYERS][HIDDEN];
     memset(h, 0, sizeof h);
-    double a[HIDDEN], b[HIDDEN], xin[HIDDEN], emb[EMBED], y[VOCAB], p[VOCAB];
+    double xin[HIDDEN], wx[HIDDEN], uh[HIDDEN], hr[HIDDEN];
+    double z[HIDDEN], rr[HIDDEN], nn[HIDDEN], emb[EMBED], y[VOCAB], p[VOCAB];
     int tok = seed & (VOCAB - 1);
 
     for (int step = 0; step < n; step++) {
         for (int j = 0; j < EMBED; j++) emb[j] = Wemb[tok][j];
         for (int l = 0; l < NUM_LAYERS; l++) {
+            const double *hp = h[l];
             if (l == 0) {
                 for (int j = 0; j < EMBED;  j++) xin[j] = emb[j];
                 for (int j = EMBED; j < HIDDEN; j++) xin[j] = 0.0;
             } else {
-                for (int j = 0; j < HIDDEN; j++) xin[j] = h[l - 1][j];
+                for (int j = 0; j < HIDDEN; j++) xin[j] = hnew[l - 1][j];
             }
-            matvec(a, &Wxh[l][0][0], xin,  HIDDEN, HIDDEN);
-            matvec(b, &Whh[l][0][0], h[l], HIDDEN, HIDDEN);
+            matvec(wx, &Wg[l][GZ][0][0], xin, HIDDEN, HIDDEN);
+            matvec(uh, &Ug[l][GZ][0][0], hp,  HIDDEN, HIDDEN);
+            for (int i = 0; i < HIDDEN; i++) z[i]  = sigmoid(wx[i] + uh[i] + bg[l][GZ][i]);
+            matvec(wx, &Wg[l][GR][0][0], xin, HIDDEN, HIDDEN);
+            matvec(uh, &Ug[l][GR][0][0], hp,  HIDDEN, HIDDEN);
+            for (int i = 0; i < HIDDEN; i++) rr[i] = sigmoid(wx[i] + uh[i] + bg[l][GR][i]);
+            for (int i = 0; i < HIDDEN; i++) hr[i] = rr[i] * hp[i];
+            matvec(wx, &Wg[l][GN][0][0], xin, HIDDEN, HIDDEN);
+            matvec(uh, &Ug[l][GN][0][0], hr,  HIDDEN, HIDDEN);
+            for (int i = 0; i < HIDDEN; i++) nn[i] = tanh(wx[i] + uh[i] + bg[l][GN][i]);
             for (int i = 0; i < HIDDEN; i++)
-                h[l][i] = tanh(a[i] + b[i] + bh[l][i]);
+                hnew[l][i] = (1.0 - z[i]) * nn[i] + z[i] * hp[i];
         }
+        for (int l = 0; l < NUM_LAYERS; l++)
+            for (int i = 0; i < HIDDEN; i++) h[l][i] = hnew[l][i];
         matvec(y, &Why[0][0], h[NUM_LAYERS - 1], VOCAB, HIDDEN);
         for (int i = 0; i < VOCAB; i++) y[i] += by[i];
         softmax(p, y, VOCAB);
@@ -364,15 +453,15 @@ static void save_model(const char *path) {
     unsigned hdr[6] = { CKPT_MAGIC, VOCAB, EMBED, HIDDEN, NUM_LAYERS, 0 };
     fwrite(hdr, sizeof(unsigned), 6, f);
     fwrite(Wemb, sizeof Wemb, 1, f);
-    fwrite(Wxh,  sizeof Wxh,  1, f);
-    fwrite(Whh,  sizeof Whh,  1, f);
-    fwrite(bh,   sizeof bh,   1, f);
+    fwrite(Wg,   sizeof Wg,   1, f);
+    fwrite(Ug,   sizeof Ug,   1, f);
+    fwrite(bg,   sizeof bg,   1, f);
     fwrite(Why,  sizeof Why,  1, f);
     fwrite(by,   sizeof by,   1, f);
     fwrite(mWemb, sizeof mWemb, 1, f);
-    fwrite(mWxh,  sizeof mWxh,  1, f);
-    fwrite(mWhh,  sizeof mWhh,  1, f);
-    fwrite(mbh,   sizeof mbh,   1, f);
+    fwrite(mWg,   sizeof mWg,   1, f);
+    fwrite(mUg,   sizeof mUg,   1, f);
+    fwrite(mbg,   sizeof mbg,   1, f);
     fwrite(mWhy,  sizeof mWhy,  1, f);
     fwrite(mby,   sizeof mby,   1, f);
     fclose(f);
@@ -390,15 +479,15 @@ static int load_model(const char *path) {
     }
     int ok = 1;
     ok &= fread(Wemb, sizeof Wemb, 1, f) == 1;
-    ok &= fread(Wxh,  sizeof Wxh,  1, f) == 1;
-    ok &= fread(Whh,  sizeof Whh,  1, f) == 1;
-    ok &= fread(bh,   sizeof bh,   1, f) == 1;
+    ok &= fread(Wg,   sizeof Wg,   1, f) == 1;
+    ok &= fread(Ug,   sizeof Ug,   1, f) == 1;
+    ok &= fread(bg,   sizeof bg,   1, f) == 1;
     ok &= fread(Why,  sizeof Why,  1, f) == 1;
     ok &= fread(by,   sizeof by,   1, f) == 1;
     ok &= fread(mWemb, sizeof mWemb, 1, f) == 1;
-    ok &= fread(mWxh,  sizeof mWxh,  1, f) == 1;
-    ok &= fread(mWhh,  sizeof mWhh,  1, f) == 1;
-    ok &= fread(mbh,   sizeof mbh,   1, f) == 1;
+    ok &= fread(mWg,   sizeof mWg,   1, f) == 1;
+    ok &= fread(mUg,   sizeof mUg,   1, f) == 1;
+    ok &= fread(mbg,   sizeof mbg,   1, f) == 1;
     ok &= fread(mWhy,  sizeof mWhy,  1, f) == 1;
     ok &= fread(mby,   sizeof mby,   1, f) == 1;
     fclose(f);
@@ -417,25 +506,37 @@ static void self_path(char *buf, size_t n, const char *argv0) {
 }
 
 /*
- * Hard safety guard.  Returns 0 (unsafe) if the command string contains
- * sudo or any destructive / privileged pattern.  `sudo` is non-negotiable.
+ * Hard safety guard.  Returns 0 (unsafe) if the command string contains any
+ * privilege-escalation or destructive pattern.  This is a best-effort denylist,
+ * not a sandbox: the whole command is scanned (no truncation), and an
+ * over-long command is refused outright rather than silently passed.
  */
 static int is_command_safe(const char *cmd) {
-    char low[1024];
+    char low[4096];
     size_t n = strlen(cmd);
-    if (n >= sizeof low) n = sizeof low - 1;
+    if (n >= sizeof low) return 0;            /* refuse — never scan a partial cmd */
     for (size_t i = 0; i < n; i++) low[i] = (char)tolower((unsigned char)cmd[i]);
     low[n] = '\0';
 
     static const char *deny[] = {
-        "sudo", "su -", "doas",
-        "rm -rf /", "rm -rf /*", "rm -rf ~", "rm -fr /",
-        "mkfs", "dd if=", "dd of=", "of=/dev/", "> /dev/sd", ">/dev/sd",
-        ":(){", "fork()", "shutdown", "reboot", "halt", "init 0", "init 6",
-        "chmod -r 777 /", "chmod 777 /", "chown -r", "> /dev/sda",
-        "mv / ", "wget http", "curl http",       /* block remote fetch+run */
-        "|sh", "| sh", "|bash", "| bash",
-        "/etc/passwd", "/etc/shadow", "crontab", "iptables -f",
+        /* privilege escalation */
+        "sudo", "su -", "su -l", "su root", "doas", "pkexec", "setpriv",
+        "runuser", "/sudo", "\tsudo",
+        /* destructive filesystem ops */
+        "rm -rf /", "rm -rf /*", "rm -rf ~", "rm -fr /", "rm -r -f /",
+        "rm -rf $home", "rm -rf .", "mkfs", "dd if=", "dd of=", "of=/dev/",
+        "> /dev/sd", ">/dev/sd", "> /dev/sda", "mv / ",
+        /* fork bombs / power state */
+        ":(){", "fork()", "shutdown", "reboot", "halt", "poweroff",
+        "init 0", "init 6", "systemctl ",
+        /* perms / ownership */
+        "chmod -r 777 /", "chmod 777 /", "chown -r",
+        /* remote fetch -> shell, reverse shells, persistence */
+        "wget http", "curl http", "|sh", "| sh", "|bash", "| bash",
+        "nc -", "ncat", "socat", "/dev/tcp/", "mkfifo",
+        ".ssh/", "authorized_keys", "bashrc", "crontab", "/etc/cron",
+        /* credential files / firewall flush */
+        "/etc/passwd", "/etc/shadow", "iptables -f", "ufw disable",
         NULL
     };
     for (int i = 0; deny[i]; i++)
@@ -557,8 +658,15 @@ static int build_command(const char *task, char *cmd, size_t cmdsz) {
     }
 
     if (kind == 1) { /* coding: actually write, compile and run a C snippet */
-        const char *src = "/tmp/slm_agent_snippet.c";
-        const char *bin = "/tmp/slm_agent_snippet";
+        /* Unique 0700 dir avoids the /tmp symlink-race of a fixed path. */
+        char dir[64] = "/tmp/sentinel_agent_XXXXXX";
+        char src[96], bin[96];
+        if (!mkdtemp(dir)) {
+            snprintf(cmd, cmdsz, "echo '[coding agent] could not create temp dir'");
+            return kind;
+        }
+        snprintf(src, sizeof src, "%s/snippet.c", dir);
+        snprintf(bin, sizeof bin, "%s/snippet", dir);
         FILE *fp = fopen(src, "w");
         if (fp) {
             if (strstr(low, "reverse") && strstr(low, "string")) {
@@ -575,9 +683,11 @@ static int build_command(const char *task, char *cmd, size_t cmdsz) {
                     fp);
             }
             fclose(fp);
+            /* note: 'rm -f' (not 'rm -rf') so the safety guard doesn't flag it */
             snprintf(cmd, cmdsz,
-                "gcc %s -o %s 2>&1 && echo '[coding agent] compiled OK, running:' && %s",
-                src, bin, bin);
+                "gcc %s -o %s 2>&1 && echo '[coding agent] compiled OK, running:' && %s; "
+                "rm -f %s %s; rmdir %s 2>/dev/null",
+                src, bin, bin, src, bin, dir);
         } else {
             snprintf(cmd, cmdsz, "echo '[coding agent] could not write snippet'");
         }
@@ -595,6 +705,7 @@ static int run_agent(const char *task) {
     const char *kinds[] = { "CYBERSECURITY", "CODING", "GENERAL" };
     char cmd[2048];
     int kind = build_command(task, cmd, sizeof cmd);
+    if (kind < 0 || kind > 2) kind = 2;          /* defensive: keep kinds[] in range */
 
     printf("\n  ┌─ sub-agent pid=%d  specialism=%s\n", (int)getpid(), kinds[kind]);
     printf("  │  task: %s\n", task);
@@ -745,7 +856,7 @@ static const char CORPUS[] =
 /* ================================================================== */
 static void print_usage(const char *prog) {
     printf(
-"Sentinel v%s — a self-contained deep-RNN AI agent in pure C.\n"
+"Sentinel v%s — a self-contained deep-GRU AI agent in pure C.\n"
 "A character-level neural net (no libraries) that learns from text, answers\n"
 "CVE questions from its corpus, and forks sub-agents to do small tasks.\n"
 "\n"
@@ -833,11 +944,12 @@ int main(int argc, char **argv) {
     }
 
     /* ---- default mode: train on the embedded corpus, sample, then serve ---- */
-    printf("=== Sentinel : self-contained deep RNN ===\n");
+    printf("=== Sentinel : self-contained deep GRU network ===\n");
     printf("arch: VOCAB=%d EMBED=%d HIDDEN=%d LAYERS=%d SEQ_LEN=%d  (%d params)\n",
            VOCAB, EMBED, HIDDEN, NUM_LAYERS, SEQ_LEN,
-           (int)(VOCAB*EMBED + NUM_LAYERS*(2*HIDDEN*HIDDEN + HIDDEN) + VOCAB*HIDDEN + VOCAB));
-    printf("Training loop (BPTT through %d stacked layers):\n", NUM_LAYERS);
+           (int)(VOCAB*EMBED + NUM_LAYERS*NGATE*(2*HIDDEN*HIDDEN + HIDDEN)
+                 + VOCAB*HIDDEN + VOCAB));
+    printf("Training loop (BPTT through %d stacked GRU layers):\n", NUM_LAYERS);
     train(CORPUS, (int)(sizeof(CORPUS) - 1), iters, 1);
 
     printf("\nGenerated sample after training (seeded with 't'):\n  \"");

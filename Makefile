@@ -1,12 +1,12 @@
-# Sentinel — self-contained deep RNN agent in pure C.
-# Free software (MIT). No external ML libraries; only libc + libm.
+# Sentinel — self-contained deep GRU agent in pure C.
+# Free software (Apache-2.0). No external ML libraries; only libc + libm.
 
 CC      ?= gcc
 CFLAGS  ?= -O2 -Wall
 LDLIBS   = -lm
 BIN      = sentinel
 PREFIX  ?= /usr/local
-VERSION ?= 0.1.0
+VERSION ?= 0.2.0
 
 .PHONY: all run train fetch quick-fetch clean distclean install uninstall package help
 
@@ -42,7 +42,8 @@ uninstall:             ## remove the installed binary
 
 package:               ## build a source release tarball
 	tar czf sentinel-$(VERSION)-src.tar.gz \
-	    main.c fetch_corpus.sh Makefile README.md LICENSE .gitignore
+	    main.c fetch_corpus.sh start.sh Makefile README.md LICENSE .gitignore \
+	    assets/sentinel-logo.svg .github/workflows/c-cpp.yml
 	@echo "built sentinel-$(VERSION)-src.tar.gz"
 
 help:                  ## list targets

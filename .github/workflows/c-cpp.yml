@@ -1,0 +1,31 @@
+name: build
+
+# Optional but handy: this compiles Sentinel and runs a quick smoke test on
+# every push / PR, so a change that breaks the build is caught automatically.
+# It is NOT required for the project to work — delete this file if you don't
+# want CI.
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compile (warnings as errors)
+        run: gcc -O2 -Wall -Wextra -Werror -o sentinel main.c -lm
+
+      - name: Smoke test — help, version, agent + safety guard
+        run: |
+          ./sentinel --version
+          ./sentinel --help | head -n 5
+          # train a couple of iters and run one agent + the sudo refusal
+          printf 'TASK: list files in this directory\nTASK: sudo rm -rf /\n' \
+            | SLM_EPOCHS=2 ./sentinel | grep -E 'REFUSED|sub-agent' || \
+            (echo "smoke test failed" && exit 1)

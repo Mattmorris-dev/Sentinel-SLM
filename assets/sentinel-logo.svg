@@ -52,7 +52,7 @@
   <text x="250" y="108" font-family="'JetBrains Mono','SF Mono',Consolas,monospace"
         font-size="58" font-weight="700" letter-spacing="2" fill="#e6f6ff">SENTINEL</text>
   <text x="252" y="146" font-family="'JetBrains Mono','SF Mono',Consolas,monospace"
-        font-size="18" letter-spacing="1.5" fill="#22d3ee">self-contained deep-RNN agent · pure C</text>
+        font-size="18" letter-spacing="1.5" fill="#22d3ee">self-contained deep-GRU agent · pure C</text>
   <text x="252" y="172" font-family="'JetBrains Mono','SF Mono',Consolas,monospace"
         font-size="13" letter-spacing="1" fill="#5b7a99">no libraries · no vendors · forks its own sub-agents</text>
 </svg>

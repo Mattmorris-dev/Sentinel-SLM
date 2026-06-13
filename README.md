@@ -2,27 +2,29 @@
   <img src="assets/sentinel-logo.svg" alt="Sentinel" width="560">
 </p>
 
-# Sentinel — a self-contained deep RNN agent in pure C
+# Sentinel — a self-contained deep GRU agent in pure C
 
 A fully self-contained Small Language Model written in standard C with **no
 external machine-learning libraries** (only libc + libm). It implements, by hand:
 
 - a **character-level tokenizer** (7-bit ASCII),
 - a **learned embedding table**,
-- a **stacked, multi-layer recurrent neural network** with hidden-state feedback,
-  so it processes a continuous stream with **no fixed token-context window**,
+- a **stacked, multi-layer GRU** (gated recurrent unit) network with hidden-state
+  feedback, so it processes a continuous stream with **no fixed token-context window**,
 - a **manual matrix-multiply** (`matvec`) used for every layer at every timestep,
 - a real **backprop-through-time** trainer (cross-entropy loss, gradient clipping,
-  Adagrad),
+  Adagrad) — full gradients through all three GRU gates,
 - **checkpoint persistence** + **online learning** so the network keeps growing its
-  skills across runs, and
+  skills across runs,
+- a **CVE lookup agent**: ask `show me a cve about <x>` and it searches the fetched
+  corpus and prints a real vulnerability writeup, and
 - a **sub-agent layer**: when it reads a line containing the trigger `TASK:`, it
   `fork()`/`exec()`s a separate process specialised in **cybersecurity / coding /
   general** work, which runs a **safe** shell command and streams the result back.
 
-It's a genuine (if tiny) deep network: real weights, real gradients — just at toy
-scale, so it learns character statistics rather than fluent prose. The value is the
-complete, dependency-free pipeline.
+It's a genuine deep network (~2.7M parameters at default size): real weights, real
+gradients, real GRU backprop. At this scale it learns character/word statistics rather
+than fluent prose — the value is the complete, dependency-free, fully local pipeline.
 
 ## Build
 
@@ -110,9 +112,10 @@ token --> [embedding] --> [RNN layer 0] --> [RNN layer 1] --> ... --> [softmax] 
   (`NUM_LAYERS`, `HIDDEN`, `EMBED`, `SEQ_LEN`) and recompile. The layer code is
   dimension-generic, so nothing else needs to change. (Changing the architecture
   starts a fresh checkpoint automatically — the old one records its own dims.)
-  The default build is **3 layers, HIDDEN=192, EMBED=64 ≈ 255K parameters**;
-  raising `HIDDEN`/`NUM_LAYERS` scales the parameter count roughly with
-  `NUM_LAYERS * HIDDEN²`.
+  The default build is **3 GRU layers, HIDDEN=384, EMBED=96 ≈ 2.7M parameters**
+  (~200 MB RAM); raising `HIDDEN`/`NUM_LAYERS` scales the parameter count roughly
+  with `NUM_LAYERS * HIDDEN²`. `VOCAB` must stay a power of two (128 = ASCII, or
+  256 for full-byte / UTF-8-bytes) because the tokenizer masks with `VOCAB-1`.
 - **Teach it more:** `./sentinel --train yourtext.txt`, or just pipe text in on
   stdin during the read loop. Both persist into `sentinel.bin`.
 - **Train longer:** `SLM_EPOCHS=20000 ./sentinel`.
@@ -128,5 +131,6 @@ executes nothing) as a global kill switch — no recompile needed.
 
 ## License
 
-Released under the [MIT License](LICENSE) — free to use, modify, and distribute,
-including commercially. No warranty. Fully self-contained and vendor-neutral.
+Released under the [Apache License 2.0](LICENSE) — free to use, modify, and
+distribute (including commercially), with an explicit patent grant. No warranty.
+Fully self-contained and vendor-neutral.
