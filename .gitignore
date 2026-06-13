@@ -1,7 +1,7 @@
 # Build artifacts and model checkpoints (regenerated locally)
-local_slm
+sentinel
 *.bin
-local_slm.bin
+sentinel.bin
 
 # Sub-agent scratch files
 /tmp/slm_agent_snippet*

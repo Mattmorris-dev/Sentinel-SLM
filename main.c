@@ -1,5 +1,5 @@
 /*
- * local_slm  —  a fully self-contained Small Language Model in standard C.
+ * Sentinel  —  a fully self-contained Small Language Model in standard C.
  *
  * No external machine-learning libraries.  Everything below — the tokenizer,
  * the embedding table, the stacked recurrent layers, the matrix multiply, the
@@ -19,13 +19,13 @@
  * "token context window".
  *
  * Modes:
- *   ./local_slm                 train/continue training, print loss + a sample,
+ *   ./sentinel                 train/continue training, print loss + a sample,
  *                               then read stdin: plain text -> online learning,
  *                               lines containing "TASK:" -> spawn a sub-agent.
- *   ./local_slm --agent "<t>"   run as a spawned sub-agent for task <t>.
- *   ./local_slm --train <file>  train extra epochs on an external corpus file.
+ *   ./sentinel --agent "<t>"   run as a spawned sub-agent for task <t>.
+ *   ./sentinel --train <file>  train extra epochs on an external corpus file.
  *
- * Build:  gcc -O2 -Wall -o local_slm main.c -lm
+ * Build:  gcc -O2 -Wall -o sentinel main.c -lm
  */
 
 #include <stdio.h>
@@ -55,7 +55,7 @@
 #define CLIP        5.0     /* gradient clipping bound                  */
 
 #define CKPT_MAGIC  0x534C4D31u   /* "SLM1" */
-#define CKPT_PATH   "local_slm.bin"
+#define CKPT_PATH   "sentinel.bin"
 
 /* ------------------------------------------------------------------ */
 /*  Parameters (static weight matrices) + Adagrad memory + gradients.  */
@@ -725,7 +725,7 @@ int main(int argc, char **argv) {
     }
 
     /* ---- default mode: train on the embedded corpus, sample, then serve ---- */
-    printf("=== local_slm : self-contained deep RNN ===\n");
+    printf("=== Sentinel : self-contained deep RNN ===\n");
     printf("arch: VOCAB=%d EMBED=%d HIDDEN=%d LAYERS=%d SEQ_LEN=%d  (%d params)\n",
            VOCAB, EMBED, HIDDEN, NUM_LAYERS, SEQ_LEN,
            (int)(VOCAB*EMBED + NUM_LAYERS*(2*HIDDEN*HIDDEN + HIDDEN) + VOCAB*HIDDEN + VOCAB));

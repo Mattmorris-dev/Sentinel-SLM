@@ -1,22 +1,22 @@
 #!/usr/bin/env bash
 #
-# fetch_corpus.sh — assemble a real-world training corpus for local_slm.
+# fetch_corpus.sh — assemble a real-world training corpus for Sentinel.
 #
-# Consolidates HIGH-STARRED security + coding repositories, neural-net /
-# RNN reference implementations, the ECC-Tools agent ecosystem, and live
-# CVE vulnerability data into ./corpus, then you train on the whole pile:
+# Consolidates HIGH-STARRED, free, open-source security + coding repositories,
+# neural-net / RNN reference implementations, and live CVE vulnerability data
+# into ./corpus, then you train on the whole pile:
 #
 #     ./fetch_corpus.sh            # full corpus (clones several repos, ~100s of MB)
 #     QUICK=1 ./fetch_corpus.sh    # small/fast demo corpus (famous CVEs + tiny repos)
 #     CVE_YEARS="2023 2024 2025" ./fetch_corpus.sh
-#     ./local_slm --train corpus   # <-- train the model on everything fetched
+#     ./sentinel --train corpus   # <-- train the model on everything fetched
 #
 # 100% FREE and self-contained: no API keys, no paid services, no Claude or
 # any other vendor dependency. It only uses git + curl to pull public,
 # cloneable GitHub repos (works behind a github.com-only egress allowlist),
-# and local_slm trains on them entirely offline afterwards. Each list below
+# and sentinel trains on them entirely offline afterwards. Each list below
 # is meant to be edited — add your own favourite repos. .git folders are
-# stripped; local_slm's consolidator skips dotfiles and caps the corpus at
+# stripped; sentinel's consolidator skips dotfiles and caps the corpus at
 # 64 MB, so over-fetching is safe.
 
 set -uo pipefail
@@ -112,4 +112,4 @@ echo
 echo "corpus assembled in '$OUT'  (size: $(du -sh "$OUT" 2>/dev/null | cut -f1))"
 echo "text/code files: $(find "$OUT" -type f \( -name '*.md' -o -name '*.c' -o -name '*.py' -o -name '*.h' -o -name '*.txt' \) 2>/dev/null | wc -l)"
 echo
-echo "next:  ./local_slm --train $OUT      # consolidate + train on it"
+echo "next:  ./sentinel --train $OUT      # consolidate + train on it"

@@ -1,4 +1,4 @@
-# local_slm — a self-contained deep RNN agent in pure C
+# Sentinel — a self-contained deep RNN agent in pure C
 
 A fully self-contained Small Language Model written in standard C with **no
 external machine-learning libraries** (only libc + libm). It implements, by hand:
@@ -23,7 +23,7 @@ complete, dependency-free pipeline.
 ## Build
 
 ```sh
-gcc -O2 -Wall -o local_slm main.c -lm
+gcc -O2 -Wall -o sentinel main.c -lm
 ```
 
 ## Run
@@ -31,16 +31,16 @@ gcc -O2 -Wall -o local_slm main.c -lm
 ```sh
 # Train on the built-in corpus, print the loss curve + a sample, then serve.
 # Plain text on stdin -> online learning. Lines with "TASK:" -> spawn a sub-agent.
-printf 'TASK: list files in this directory\nTASK: write a C function to reverse a string\n' | ./local_slm
+printf 'TASK: list files in this directory\nTASK: write a C function to reverse a string\n' | ./sentinel
 ```
 
 Other modes:
 
 ```sh
-./local_slm --agent "<task>"           # run directly as a single sub-agent
-./local_slm --train corpus.txt         # absorb one corpus file, then checkpoint
-./local_slm --train ./data             # consolidate a WHOLE directory tree
-./local_slm --train a.txt b.md ./src   # consolidate several files + dirs at once
+./sentinel --agent "<task>"           # run directly as a single sub-agent
+./sentinel --train corpus.txt         # absorb one corpus file, then checkpoint
+./sentinel --train ./data             # consolidate a WHOLE directory tree
+./sentinel --train a.txt b.md ./src   # consolidate several files + dirs at once
 ```
 
 ### Data consolidation (feed the bigger net more data)
@@ -52,7 +52,7 @@ recursively and every text/code file (`.txt .md .c .h .py .js .json .csv .html
 help if they have more data to learn from — this is how you supply it:
 
 ```sh
-SLM_EPOCHS=20000 ./local_slm --train ./my_notes ./some_repo/src
+SLM_EPOCHS=20000 ./sentinel --train ./my_notes ./some_repo/src
 ```
 
 ### Fetch real-world data: `fetch_corpus.sh`
@@ -68,7 +68,7 @@ training runs fully offline afterwards.
 QUICK=1 ./fetch_corpus.sh        # small/fast demo: famous CVEs + a couple repos
 ./fetch_corpus.sh                # full corpus (several repos + recent CVE years)
 CVE_YEARS="2022 2023 2024 2025" ./fetch_corpus.sh
-./local_slm --train corpus       # consolidate + train on everything fetched
+./sentinel --train corpus       # consolidate + train on everything fetched
 ```
 
 Sources are grouped in editable arrays at the top of the script:
@@ -98,9 +98,9 @@ token --> [embedding] --> [RNN layer 0] --> [RNN layer 1] --> ... --> [softmax] 
   The default build is **3 layers, HIDDEN=192, EMBED=64 ≈ 255K parameters**;
   raising `HIDDEN`/`NUM_LAYERS` scales the parameter count roughly with
   `NUM_LAYERS * HIDDEN²`.
-- **Teach it more:** `./local_slm --train yourtext.txt`, or just pipe text in on
-  stdin during the read loop. Both persist into `local_slm.bin`.
-- **Train longer:** `SLM_EPOCHS=20000 ./local_slm`.
+- **Teach it more:** `./sentinel --train yourtext.txt`, or just pipe text in on
+  stdin during the read loop. Both persist into `sentinel.bin`.
+- **Train longer:** `SLM_EPOCHS=20000 ./sentinel`.
 
 ## Safety
 
