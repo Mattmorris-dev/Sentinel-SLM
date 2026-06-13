@@ -49,6 +49,15 @@ RNN_REPOS=(
   "karpathy/char-rnn"                    # the original char-level RNN
   "karpathy/nanoGPT"                     # minimal GPT
 )
+# Malware-analysis knowledge (for the 'malware' retrieval topic).
+MALWARE_REPOS=(
+  "rshipp/awesome-malware-analysis"      # curated malware-analysis resources
+  "InQuest/awesome-yara"                 # YARA detection rules/resources
+)
+# OSINT knowledge (for the 'osint' retrieval topic).
+OSINT_REPOS=(
+  "jivoi/awesome-osint"                  # the big OSINT resource list
+)
 
 # In QUICK mode swap the big lists for tiny, fast ones. CVE data already
 # supplies the security content, so the quick security clone is skipped.
@@ -56,17 +65,19 @@ if [ "${QUICK:-0}" = "1" ]; then
   SECURITY_REPOS=()
   CODING_REPOS=("TheAlgorithms/C")
   RNN_REPOS=("karpathy/micrograd")
+  MALWARE_REPOS=("rshipp/awesome-malware-analysis")
+  OSINT_REPOS=("jivoi/awesome-osint")
 fi
 
 # --- helpers ------------------------------------------------------------
 clone_repo() {
-  local repo="$1" dest
+  local repo="$1" prefix="${2:-}" dest
   # validate owner/name so a crafted list entry can't traverse paths or
   # inject git arguments
   if ! printf '%s' "$repo" | grep -qE '^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$'; then
     echo "  ! skip (invalid repo name)  $repo"; return
   fi
-  dest="$OUT/$(echo "$repo" | tr '/.' '__')"
+  dest="$OUT/${prefix}$(echo "$repo" | tr '/.' '__')"
   if [ -d "$dest" ]; then echo "  skip (exists)  $repo"; return; fi
   echo "  cloning  $repo"
   if timeout 240 git clone --depth "$DEPTH" --quiet "https://github.com/$repo" "$dest" 2>/dev/null; then
@@ -115,6 +126,10 @@ echo "=== coding repos ==="
 for r in ${CODING_REPOS[@]+"${CODING_REPOS[@]}"}; do clone_repo "$r"; done
 echo "=== RNN / neural-net reference repos ==="
 for r in ${RNN_REPOS[@]+"${RNN_REPOS[@]}"}; do clone_repo "$r"; done
+echo "=== malware-analysis knowledge ==="
+for r in ${MALWARE_REPOS[@]+"${MALWARE_REPOS[@]}"}; do clone_repo "$r" "malware_"; done
+echo "=== OSINT knowledge ==="
+for r in ${OSINT_REPOS[@]+"${OSINT_REPOS[@]}"}; do clone_repo "$r" "osint_"; done
 echo "=== CVE vulnerability data ==="
 if [ "${QUICK:-0}" = "1" ]; then fetch_cves_quick; else fetch_cves_sparse; fi
 

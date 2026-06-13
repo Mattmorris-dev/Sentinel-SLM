@@ -10,12 +10,20 @@ BIN      = sentinel
 PREFIX  ?= /usr/local
 VERSION ?= 0.3.0
 
-.PHONY: all run train fetch quick-fetch clean distclean install uninstall package help
+.PHONY: all both slm run train fetch quick-fetch clean distclean install uninstall package help
 
-all: $(BIN)            ## build the binary
+all: $(BIN)            ## build the big model (default)
 
 $(BIN): main.c
 	$(CC) $(CFLAGS) -o $@ main.c $(LDLIBS)
+
+# A genuine small LM from the SAME source (~1.2M params, no -mcmodel=large).
+# Uses its own checkpoint so it can coexist with the big model.
+slm: main.c            ## build a small SLM (sentinel-slm, ~1.2M params)
+	$(CC) -O2 -Wall -DHIDDEN=256 -DEMBED=64 -DNUM_LAYERS=2 \
+	    -DCKPT_PATH='"sentinel-slm.bin"' -o sentinel-slm main.c $(LDLIBS)
+
+both: $(BIN) slm       ## build BOTH the big model and the small SLM
 
 run: $(BIN)            ## train on the built-in corpus, then serve the read/agent loop
 	./$(BIN)

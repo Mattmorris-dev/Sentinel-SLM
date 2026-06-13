@@ -50,11 +50,25 @@
 /*  The code below is dimension-generic, so changing them and          */
 /*  recompiling is all that's needed to deepen / widen the model.      */
 /* ------------------------------------------------------------------ */
+/* The size knobs are -D-overridable so you can build BOTH a big model and a
+ * small SLM from the same source, e.g.:
+ *   gcc -O2 -mcmodel=large -o sentinel     main.c -lm                 (big, default)
+ *   gcc -O2 -DHIDDEN=256 -DEMBED=64 -DNUM_LAYERS=2 -o sentinel-slm main.c -lm  (small) */
+#ifndef VOCAB
 #define VOCAB       128     /* character-level tokenizer: 7-bit ASCII   */
+#endif
+#ifndef EMBED
 #define EMBED       128     /* learned embedding dimension              */
+#endif
+#ifndef HIDDEN
 #define HIDDEN      2368    /* hidden units per GRU layer               */
+#endif
+#ifndef NUM_LAYERS
 #define NUM_LAYERS  3       /* stacked GRU layers (depth)               */
+#endif
+#ifndef SEQ_LEN
 #define SEQ_LEN     32      /* BPTT unroll length                       */
+#endif
 #define LR          0.002   /* base learning rate (Adam)                */
 #define CLIP        5.0     /* gradient clipping bound                  */
 #define ADAM_B1     0.9     /* Adam first-moment decay                  */
@@ -72,7 +86,9 @@
  * of two (the tokenizer masks with VOCAB-1). Dimension-generic otherwise. */
 
 #define CKPT_MAGIC  0x534C4D33u   /* "SLM3" — GRU + Adam checkpoint format */
+#ifndef CKPT_PATH
 #define CKPT_PATH   "sentinel.bin"
+#endif
 #define VERSION     "0.3.0"
 
 /* ------------------------------------------------------------------ */
@@ -581,8 +597,10 @@ static int is_command_safe(const char *cmd) {
         "init 0", "init 6", "systemctl ",
         /* perms / ownership */
         "chmod -r 777 /", "chmod 777 /", "chown -r",
-        /* remote fetch -> shell, reverse shells, persistence */
-        "wget http", "curl http", "|sh", "| sh", "|bash", "| bash",
+        /* pipe-to-shell (the real RCE vector), reverse shells, persistence.
+         * Note: a bare curl/wget is allowed (used for live CVE lookup); only
+         * piping fetched content into a shell is blocked. */
+        "|sh", "| sh", "|bash", "| bash", "curl|", "wget|", "|python", "| python",
         "nc -", "ncat", "socat", "/dev/tcp/", "mkfifo",
         ".ssh/", "authorized_keys", "bashrc", "crontab", "/etc/cron",
         /* credential files / firewall flush */
@@ -663,24 +681,66 @@ static int build_command(const char *task, char *cmd, size_t cmdsz) {
     for (size_t i = 0; i < n; i++) low[i] = (char)tolower((unsigned char)task[i]);
     low[n] = '\0';
 
-    /* CVE / vulnerability lookup: search the fetched corpus and show real hits. */
-    if (strstr(low, "cve") || strstr(low, "vuln")) {
+    /* Extract a sanitized CVE id (CVE-YYYY-NNNN..) from the task, if present;
+     * only [0-9-] + the literal "CVE" reach the shell, so it's injection-safe. */
+    char cve_id[24] = "";
+    {
+        const char *u = low;
+        while ((u = strstr(u, "cve-")) != NULL) {
+            int y = 0, d = 0; const char *q = u + 4;
+            while (isdigit((unsigned char)q[y])) y++;
+            if (y == 4 && q[4] == '-') {
+                const char *r = q + 5;
+                while (isdigit((unsigned char)r[d]) && d < 9) d++;
+                if (d >= 4) {
+                    snprintf(cve_id, sizeof cve_id, "CVE-%.4s-%.*s", q, d, r);
+                    break;
+                }
+            }
+            u += 4;
+        }
+    }
+
+    /* Knowledge retrieval (RAG): grep the local corpus for CVE / malware /
+     * OSINT facts.  This is how the SMALL LM stays small — knowledge lives in
+     * the corpus and is retrieved, not baked into weights.  With SLM_ONLINE=1
+     * and a CVE id in the query, it also fetches that CVE LIVE from the net. */
+    if (strstr(low, "cve") || strstr(low, "vuln") || strstr(low, "malware") ||
+        strstr(low, "ransomware") || strstr(low, "apt") || strstr(low, "ioc") ||
+        strstr(low, "yara") || strstr(low, "trojan") || strstr(low, "osint") ||
+        strstr(low, "recon") || strstr(low, "subdomain") || strstr(low, "breach") ||
+        strstr(low, "threat")) {
+        const char *topic = "knowledge";
+        if (strstr(low,"cve")||strstr(low,"vuln"))                 topic = "cve";
+        else if (strstr(low,"malware")||strstr(low,"ransomware")||
+                 strstr(low,"apt")||strstr(low,"ioc")||
+                 strstr(low,"yara")||strstr(low,"trojan"))         topic = "malware";
+        else if (strstr(low,"osint")||strstr(low,"recon")||
+                 strstr(low,"subdomain")||strstr(low,"breach"))    topic = "osint";
         char kw[256];
         extract_keywords(task, kw, sizeof kw);
         snprintf(cmd, cmdsz,
-            "dir=corpus; [ -d \"$dir\" ] || dir=.; "
-            "echo '[cve agent] searching '\"$dir\"' for: %s'; "
+            /* live internet fetch of a specific CVE id (opt-in via SLM_ONLINE) */
+            "if [ -n \"$SLM_ONLINE\" ] && [ -n '%s' ] && command -v curl >/dev/null; then "
+            "  id='%s'; yr=$(echo \"$id\" | cut -d- -f2); "
+            "  echo \"[online] fetching $id live from the internet...\"; "
+            "  curl -s --max-time 12 \"https://raw.githubusercontent.com/trickest/cve/main/$yr/$id.md\""
+            "  | sed -n '1,18p'; echo; fi; "
+            /* local corpus retrieval (works fully offline) */
+            "dir=corpus; [ -d \"$dir\" ] || dir=.; topic=%s; "
+            "echo \"[retrieval agent] topic=$topic  searching $dir for: %s\"; "
+            "sub=$(ls -d \"$dir\"/*\"$topic\"* 2>/dev/null | head -1); "
+            "[ -n \"$sub\" ] && dir=\"$sub\"; "
             "hits=$(grep -rIl -i -E '%s' \"$dir\" --include='*.md' 2>/dev/null | head -3); "
+            "[ -z \"$hits\" ] && hits=$(grep -rIl -i -E '%s' corpus 2>/dev/null --include='*.md' | head -3); "
             "if [ -z \"$hits\" ]; then "
-            "echo 'no keyword match — showing a sample real CVE from the corpus:'; "
-            "hits=$(grep -rIl -E 'CVE-[0-9]{4}-[0-9]+' \"$dir\" --include='*.md' 2>/dev/null | head -1); fi; "
-            "if [ -z \"$hits\" ]; then "
-            "echo 'no CVE writeups in corpus — run ./fetch_corpus.sh (recent years) first'; "
+            "echo 'no local match — run ./fetch_corpus.sh, or set SLM_ONLINE=1 with a CVE id'; "
             "else for f in $hits; do echo \"=== $f ===\"; "
-            "grep -i -m1 -E 'CVE-[0-9]{4}-[0-9]+' \"$f\"; "
-            "sed -n '/### Description/,/###/p' \"$f\" | sed '1d;$d' | head -8; echo; done; fi",
-            kw, kw);
-        return 0;  /* report as cyber specialism */
+            "grep -i -m1 -E 'CVE-[0-9]{4}-[0-9]+|^#|title' \"$f\" 2>/dev/null; "
+            "sed -n '/[Dd]escription/,/###/p' \"$f\" 2>/dev/null | sed '1d;$d' | head -8; "
+            "head -6 \"$f\"; echo; done; fi",
+            cve_id, cve_id, topic, kw, kw, kw);
+        return 0;  /* cyber specialism */
     }
 
     if (strstr(low, "list") && (strstr(low, "file") || strstr(low, "dir"))) {
@@ -1179,8 +1239,10 @@ static void print_usage(const char *prog) {
 "      TASK: scan local network ports\n"
 "  FANOUT: <n> <something>   spawn up to 100 sub-agents CONCURRENTLY for a task,\n"
 "                            e.g.  FANOUT: 100 scan local network ports\n"
-"  show me a cve about <x>   ask about a vulnerability — searches your corpus\n"
-"                            and prints a real CVE (no 'TASK:' needed)\n"
+"  cve / malware / osint <x> retrieval (RAG): greps the local corpus for real\n"
+"                            CVE / malware-analysis / OSINT facts (no 'TASK:' needed).\n"
+"                            Mention a CVE-id (e.g. CVE-2021-44228) with SLM_ONLINE=1\n"
+"                            to fetch it LIVE from the internet.\n"
 "  (each agent is auto-assigned a difficulty tier — light/medium/heavy — which\n"
 "   sets its compute/parameter budget; easy tasks get a smaller budget.)\n"
 "  <any other text>          is absorbed as live training data (online learning)\n"

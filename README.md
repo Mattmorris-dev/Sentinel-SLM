@@ -16,8 +16,9 @@ external machine-learning libraries** (only libc + libm). It implements, by hand
   Adam) — full gradients through all three GRU gates,
 - **checkpoint persistence** + **online learning** so the network keeps growing its
   skills across runs,
-- a **CVE lookup agent**: ask `show me a cve about <x>` and it searches the fetched
-  corpus and prints a real vulnerability writeup, and
+- a **retrieval (RAG) agent**: ask `show me a cve / malware / osint about <x>` and it
+  greps the local corpus for real CVE / malware-analysis / OSINT facts — this is how
+  the small model stays small (knowledge lives in the corpus, not the weights), and
 - a **sub-agent layer**: when it reads a line containing the trigger `TASK:`, it
   `fork()`/`exec()`s a separate process specialised in **cybersecurity / coding /
   general** work, which runs a **safe** shell command and streams the result back.
@@ -36,7 +37,9 @@ gcc -O2 -Wall -mcmodel=large -o sentinel main.c -lm
 …or use the Makefile:
 
 ```sh
-make            # build ./sentinel
+make            # build the big model (./sentinel)
+make slm        # build a small ~1.2M-param SLM (./sentinel-slm, plain gcc)
+make both       # build BOTH
 make quick-fetch && make train   # fetch a demo corpus and train on it
 make run        # train on the built-in corpus, then serve the agent loop
 make install    # install to /usr/local/bin (PREFIX overridable)
