@@ -36,6 +36,9 @@
 #include <unistd.h>
 #include <sys/wait.h>
 #include <sys/types.h>
+#include <sys/stat.h>
+#include <dirent.h>
+#include <strings.h>
 #include <limits.h>
 
 /* ------------------------------------------------------------------ */
@@ -44,10 +47,10 @@
 /*  recompiling is all that's needed to deepen / widen the model.      */
 /* ------------------------------------------------------------------ */
 #define VOCAB       128     /* character-level tokenizer: 7-bit ASCII   */
-#define EMBED       48      /* learned embedding dimension              */
-#define HIDDEN      96      /* hidden units per recurrent layer         */
-#define NUM_LAYERS  2       /* stacked recurrent layers (depth)         */
-#define SEQ_LEN     25      /* BPTT unroll length                       */
+#define EMBED       64      /* learned embedding dimension              */
+#define HIDDEN      192     /* hidden units per recurrent layer         */
+#define NUM_LAYERS  3       /* stacked recurrent layers (depth)         */
+#define SEQ_LEN     32      /* BPTT unroll length                       */
 #define LR          0.10    /* base learning rate (Adagrad)             */
 #define CLIP        5.0     /* gradient clipping bound                  */
 
@@ -585,6 +588,89 @@ static void spawn_agent(const char *selfexe, const char *task) {
 }
 
 /* ================================================================== */
+/*  Data consolidation                                                 */
+/*                                                                     */
+/*  More parameters need more data.  These helpers fold many text /    */
+/*  code files (or a whole directory tree) into ONE training corpus    */
+/*  held in a growable buffer, so a bigger network has enough to learn */
+/*  from.  Used by `--train <path...>`.                                */
+/* ================================================================== */
+#define CORPUS_CAP_MAX (64u * 1024u * 1024u)   /* 64 MB safety ceiling */
+
+typedef struct { char *buf; size_t len; size_t cap; int files; } Corpus;
+
+static void corpus_reserve(Corpus *c, size_t extra) {
+    if (c->len + extra + 1 <= c->cap) return;
+    size_t want = c->cap ? c->cap : 65536;
+    while (want < c->len + extra + 1) want *= 2;
+    if (want > CORPUS_CAP_MAX) want = CORPUS_CAP_MAX;
+    char *n = realloc(c->buf, want);
+    if (n) { c->buf = n; c->cap = want; }
+}
+
+/* Is this a text-ish file worth feeding to a character model? */
+static int has_text_ext(const char *name) {
+    static const char *ext[] = {
+        ".txt",".md",".c",".h",".cpp",".hpp",".cc",".py",".js",".ts",
+        ".json",".yaml",".yml",".cfg",".ini",".log",".csv",".html",".css",
+        ".java",".rs",".go",".sh",".rb",".php",".sql",".xml",".tex", NULL };
+    const char *dot = strrchr(name, '.');
+    if (!dot) return 0;
+    for (int i = 0; ext[i]; i++) if (strcasecmp(dot, ext[i]) == 0) return 1;
+    return 0;
+}
+
+static void corpus_append_file(Corpus *c, const char *path) {
+    if (c->len >= CORPUS_CAP_MAX) return;
+    FILE *f = fopen(path, "rb");
+    if (!f) return;
+    char chunk[65536];
+    size_t r, added = 0;
+    while ((r = fread(chunk, 1, sizeof chunk, f)) > 0) {
+        if (c->len >= CORPUS_CAP_MAX) break;
+        corpus_reserve(c, r);
+        if (c->len + r > c->cap - 1) r = (c->cap > c->len + 1) ? c->cap - 1 - c->len : 0;
+        if (r == 0) break;
+        memcpy(c->buf + c->len, chunk, r);
+        c->len += r; added += r;
+    }
+    fclose(f);
+    if (added) {
+        corpus_reserve(c, 2);
+        if (c->len + 1 < c->cap) c->buf[c->len++] = '\n';
+        c->files++;
+        printf("  + consolidated %-48s (%zu bytes)\n", path, added);
+    }
+}
+
+/* Recursively walk a directory tree, consolidating every text file. */
+static void corpus_append_dir(Corpus *c, const char *dir, int depth) {
+    if (depth > 16 || c->len >= CORPUS_CAP_MAX) return;
+    DIR *d = opendir(dir);
+    if (!d) return;
+    struct dirent *e;
+    char path[PATH_MAX];
+    while ((e = readdir(d)) != NULL) {
+        if (e->d_name[0] == '.') continue;          /* skip . .. and dotfiles (.git) */
+        snprintf(path, sizeof path, "%s/%s", dir, e->d_name);
+        struct stat st;
+        if (stat(path, &st) != 0) continue;
+        if (S_ISDIR(st.st_mode))      corpus_append_dir(c, path, depth + 1);
+        else if (S_ISREG(st.st_mode) && has_text_ext(e->d_name))
+                                       corpus_append_file(c, path);
+    }
+    closedir(d);
+}
+
+/* Consolidate a path that may be a file or a directory. */
+static void corpus_append_path(Corpus *c, const char *path) {
+    struct stat st;
+    if (stat(path, &st) != 0) { fprintf(stderr, "  ! skip %s (not found)\n", path); return; }
+    if (S_ISDIR(st.st_mode)) corpus_append_dir(c, path, 0);
+    else                     corpus_append_file(c, path);
+}
+
+/* ================================================================== */
 /*  Embedded bootstrap corpus (cybersecurity + coding flavoured).      */
 /* ================================================================== */
 static const char CORPUS[] =
@@ -618,17 +704,21 @@ int main(int argc, char **argv) {
     const char *env_ep = getenv("SLM_EPOCHS");
     if (env_ep) { int v = atoi(env_ep); if (v > 0) iters = v; }
 
-    /* ---- external-corpus training mode ---- */
+    /* ---- external-corpus training mode (with data consolidation) ---- */
     if (argc >= 3 && strcmp(argv[1], "--train") == 0) {
-        FILE *f = fopen(argv[2], "rb");
-        if (!f) { fprintf(stderr, "cannot open %s\n", argv[2]); return 1; }
-        fseek(f, 0, SEEK_END); long sz = ftell(f); fseek(f, 0, SEEK_SET);
-        if (sz <= 0) { fclose(f); fprintf(stderr, "empty corpus\n"); return 1; }
-        char *buf = malloc(sz + 1);
-        size_t got = fread(buf, 1, sz, f); buf[got] = '\0'; fclose(f);
-        printf("Training on '%s' (%zu bytes) for %d iters...\n", argv[2], got, iters);
-        train(buf, (int)got, iters, 1);
-        free(buf);
+        Corpus c = {0};
+        printf("Consolidating training data from %d path(s):\n", argc - 2);
+        for (int i = 2; i < argc; i++) corpus_append_path(&c, argv[i]);
+        if (c.len < SEQ_LEN + 1) {
+            fprintf(stderr, "consolidated corpus too small (%zu bytes)\n", c.len);
+            free(c.buf);
+            return 1;
+        }
+        c.buf[c.len] = '\0';
+        printf("Consolidated %d file(s) -> %zu bytes. Training for %d iters...\n",
+               c.files, c.len, iters);
+        train(c.buf, (int)c.len, iters, 1);
+        free(c.buf);
         save_model(CKPT_PATH);
         printf("Checkpoint saved to '%s'.\n", CKPT_PATH);
         return 0;
