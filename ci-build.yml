@@ -1,3 +1,5 @@
+# To enable as GitHub Actions CI, copy this file to .github/workflows/c-cpp.yml
+# (the cloud sandbox cannot push workflow files; you can from your own machine).
 name: build
 
 # Optional but handy: this compiles Sentinel and runs a quick smoke test on
