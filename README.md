@@ -26,6 +26,17 @@ complete, dependency-free pipeline.
 gcc -O2 -Wall -o sentinel main.c -lm
 ```
 
+…or use the Makefile:
+
+```sh
+make            # build ./sentinel
+make quick-fetch && make train   # fetch a demo corpus and train on it
+make run        # train on the built-in corpus, then serve the agent loop
+make install    # install to /usr/local/bin (PREFIX overridable)
+make package    # build a source release tarball
+make help       # list all targets
+```
+
 ## Run
 
 ```sh
@@ -110,3 +121,8 @@ destructive/privileged patterns (`rm -rf /`, `mkfs`, `dd of=`, fork bombs,
 `shutdown`/`reboot`, pipe-to-shell from the network, reads of `/etc/shadow`, …).
 Set `SLM_NO_EXEC=1` to force **plan-only** mode (prints the command it *would* run,
 executes nothing) as a global kill switch — no recompile needed.
+
+## License
+
+Released under the [MIT License](LICENSE) — free to use, modify, and distribute,
+including commercially. No warranty. Fully self-contained and vendor-neutral.
