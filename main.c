@@ -92,7 +92,7 @@
 #ifndef CKPT_PATH
 #define CKPT_PATH   "sentinel.bin"
 #endif
-#define VERSION     "0.3.0"
+#define VERSION     "0.4.0"
 
 /* ------------------------------------------------------------------ */
 /*  Parameters — a stacked GRU (gated recurrent unit) network.         */
@@ -559,6 +559,148 @@ static int load_model(const char *path) {
     ok &= fread(vWhy,  sizeof vWhy,  1, f) == 1;
     ok &= fread(vby,   sizeof vby,   1, f) == 1;
     ok &= fread(&g_adam_t, sizeof g_adam_t, 1, f) == 1;
+    fclose(f);
+    return ok;
+}
+
+/* ================================================================== */
+/*  Weight quantization — ship a SMALL model, keep the float one safe.  */
+/*                                                                     */
+/*  The trained weights live as 8-byte doubles (~1.85 GB at the 58M    */
+/*  default).  That is huge to ship to a Pi / USB stick / ESP32.  These */
+/*  routines export a compact quantized copy of the big weight matrices */
+/*  WITHOUT touching the float checkpoint:                              */
+/*                                                                     */
+/*    int8  — 1 byte/param, per-row symmetric scale.  ~8x smaller than  */
+/*            the double checkpoint, keeps ~all the quality.            */
+/*    1-bit — 1 bit/param (the sign) + a per-row magnitude alpha        */
+/*            (BinaryConnect / XNOR-Net style).  ~64x smaller; lossy,   */
+/*            but small enough to fit a bigger model on tiny hardware.  */
+/*                                                                     */
+/*  Biases and the embedding stay full/float precision — they are tiny  */
+/*  and quality-critical.  Quantization is done ROW BY ROW into a small */
+/*  heap buffer, so no large extra array is ever allocated (the default */
+/*  build must stay under the 2 GB static-data limit).                  */
+/* ================================================================== */
+#define QUANT_MAGIC 0x534C4D51u   /* "SLMQ" — quantized export format */
+
+/* Write one row-major tensor (rows x cols) to f, quantized per row. */
+static int quant_write_tensor(FILE *f, const double *M, int rows, int cols, int qmode) {
+    signed char   *q8 = (qmode == 8) ? malloc((size_t)cols)         : NULL;
+    unsigned char *q1 = (qmode == 1) ? malloc(((size_t)cols + 7) / 8) : NULL;
+    if ((qmode == 8 && !q8) || (qmode == 1 && !q1)) { free(q8); free(q1); return 0; }
+    for (int i = 0; i < rows; i++) {
+        const double *row = M + (size_t)i * cols;
+        if (qmode == 8) {
+            double mx = 0.0;
+            for (int j = 0; j < cols; j++) { double a = fabs(row[j]); if (a > mx) mx = a; }
+            float scale = (mx > 0.0) ? (float)(mx / 127.0) : 1.0f;
+            fwrite(&scale, sizeof scale, 1, f);
+            for (int j = 0; j < cols; j++) {
+                long v = lround(row[j] / scale);
+                if (v >  127) v =  127;
+                if (v < -127) v = -127;
+                q8[j] = (signed char)v;
+            }
+            fwrite(q8, 1, (size_t)cols, f);
+        } else {
+            double s = 0.0;
+            for (int j = 0; j < cols; j++) s += fabs(row[j]);
+            float alpha = (cols > 0 && s > 0.0) ? (float)(s / cols) : 1.0f;
+            fwrite(&alpha, sizeof alpha, 1, f);
+            size_t nb = ((size_t)cols + 7) / 8;
+            memset(q1, 0, nb);
+            for (int j = 0; j < cols; j++)
+                if (row[j] >= 0.0) q1[j >> 3] |= (unsigned char)(1u << (j & 7));
+            fwrite(q1, 1, nb, f);
+        }
+    }
+    free(q8); free(q1);
+    return 1;
+}
+
+/* Read one quantized tensor back, dequantizing into the double array M. */
+static int quant_read_tensor(FILE *f, double *M, int rows, int cols, int qmode) {
+    signed char   *q8 = (qmode == 8) ? malloc((size_t)cols)         : NULL;
+    unsigned char *q1 = (qmode == 1) ? malloc(((size_t)cols + 7) / 8) : NULL;
+    if ((qmode == 8 && !q8) || (qmode == 1 && !q1)) { free(q8); free(q1); return 0; }
+    int ok = 1;
+    for (int i = 0; i < rows && ok; i++) {
+        double *row = M + (size_t)i * cols;
+        if (qmode == 8) {
+            float scale;
+            ok &= fread(&scale, sizeof scale, 1, f) == 1;
+            ok &= fread(q8, 1, (size_t)cols, f) == (size_t)cols;
+            for (int j = 0; j < cols && ok; j++) row[j] = (double)q8[j] * scale;
+        } else {
+            float alpha;
+            size_t nb = ((size_t)cols + 7) / 8;
+            ok &= fread(&alpha, sizeof alpha, 1, f) == 1;
+            ok &= fread(q1, 1, nb, f) == nb;
+            for (int j = 0; j < cols && ok; j++)
+                row[j] = (q1[j >> 3] & (1u << (j & 7))) ? (double)alpha : -(double)alpha;
+        }
+    }
+    free(q8); free(q1);
+    return ok;
+}
+
+/* Small full-precision tensors (biases) are stored as float32. */
+static void f32_write(FILE *f, const double *a, int n) {
+    for (int i = 0; i < n; i++) { float v = (float)a[i]; fwrite(&v, sizeof v, 1, f); }
+}
+static int f32_read(FILE *f, double *a, int n) {
+    int ok = 1;
+    for (int i = 0; i < n; i++) { float v; ok &= fread(&v, sizeof v, 1, f) == 1; a[i] = v; }
+    return ok;
+}
+
+/* Export a quantized copy of the current weights.  Refuses to overwrite the
+ * float checkpoint, so a trained model can never be clobbered by accident. */
+static int save_quant(const char *path, int qmode) {
+    if (strcmp(path, CKPT_PATH) == 0) {
+        fprintf(stderr, "quantize: refusing to overwrite the float checkpoint '%s'\n", path);
+        return 0;
+    }
+    FILE *f = fopen(path, "wb");
+    if (!f) return 0;
+    unsigned hdr[7] = { QUANT_MAGIC, (unsigned)qmode, VOCAB, EMBED, HIDDEN, NUM_LAYERS, 1u };
+    fwrite(hdr, sizeof(unsigned), 7, f);
+    int ok = 1;
+    ok &= quant_write_tensor(f, &Wemb[0][0], VOCAB, EMBED, qmode);
+    for (int l = 0; l < NUM_LAYERS && ok; l++)
+        for (int g = 0; g < NGATE && ok; g++) {
+            ok &= quant_write_tensor(f, &Wg[l][g][0][0], HIDDEN, HIDDEN, qmode);
+            ok &= quant_write_tensor(f, &Ug[l][g][0][0], HIDDEN, HIDDEN, qmode);
+        }
+    ok &= quant_write_tensor(f, &Why[0][0], VOCAB, HIDDEN, qmode);
+    f32_write(f, &bg[0][0][0], NUM_LAYERS * NGATE * HIDDEN);   /* biases: full precision */
+    f32_write(f, by, VOCAB);
+    fclose(f);
+    return ok;
+}
+
+/* Load a quantized export, dequantizing into the live weight arrays so the
+ * existing sample()/forward path can run it unchanged. */
+static int load_quant(const char *path) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return 0;
+    unsigned hdr[7];
+    if (fread(hdr, sizeof(unsigned), 7, f) != 7 || hdr[0] != QUANT_MAGIC ||
+        hdr[2] != VOCAB || hdr[3] != EMBED || hdr[4] != HIDDEN || hdr[5] != NUM_LAYERS) {
+        fclose(f);
+        return 0;   /* wrong format or architecture -> caller handles it */
+    }
+    int qmode = (int)hdr[1], ok = 1;
+    ok &= quant_read_tensor(f, &Wemb[0][0], VOCAB, EMBED, qmode);
+    for (int l = 0; l < NUM_LAYERS && ok; l++)
+        for (int g = 0; g < NGATE && ok; g++) {
+            ok &= quant_read_tensor(f, &Wg[l][g][0][0], HIDDEN, HIDDEN, qmode);
+            ok &= quant_read_tensor(f, &Ug[l][g][0][0], HIDDEN, HIDDEN, qmode);
+        }
+    ok &= quant_read_tensor(f, &Why[0][0], VOCAB, HIDDEN, qmode);
+    ok &= f32_read(f, &bg[0][0][0], NUM_LAYERS * NGATE * HIDDEN);
+    ok &= f32_read(f, by, VOCAB);
     fclose(f);
     return ok;
 }
@@ -1231,6 +1373,13 @@ static void print_usage(const char *prog) {
 "  %s --agent \"<task>\"     run once as a single sub-agent for <task>\n"
 "  %s --tui                styled terminal UI (interactive agent console)\n"
 "  %s --serve [port]       web GUI on http://127.0.0.1:8080 (localhost only)\n"
+"  %s --quantize <int8|1bit> [out]\n"
+"                            export a SMALL quantized copy of the model for\n"
+"                            shipping (int8 ~8x / 1bit ~64x smaller); the float\n"
+"                            checkpoint is never touched\n"
+"  %s --sample-quant <file> [n]\n"
+"                            load a quantized model and print an n-char sample\n"
+"                            (verify the small model still generates)\n"
 "  %s --help | -h          show this help\n"
 "  %s --version            print version\n"
 "\n"
@@ -1263,7 +1412,7 @@ static void print_usage(const char *prog) {
 "  Sub-agents run real shell commands but a hard guard refuses 'sudo' and\n"
 "  destructive patterns (rm -rf /, mkfs, dd, fork bombs, shutdown, ...).\n"
 "  Set SLM_NO_EXEC=1 to disable command execution entirely.\n",
-        VERSION, prog, prog, prog, prog, prog, prog, prog, prog);
+        VERSION, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog);
 }
 
 int main(int argc, char **argv) {
@@ -1299,6 +1448,45 @@ int main(int argc, char **argv) {
 
     srand(1234567u);
     init_weights();
+
+    /* ---- quantized export (non-destructive) and quantized-sample verify ---- */
+    if (argc >= 3 && strcmp(argv[1], "--quantize") == 0) {
+        int qmode = (strcmp(argv[2], "1bit") == 0 || strcmp(argv[2], "1") == 0) ? 1 : 8;
+        const char *out = (argc >= 4) ? argv[3]
+                        : (qmode == 1 ? "sentinel-1bit.bin" : "sentinel-int8.bin");
+        if (load_model(CKPT_PATH))
+            printf("Loaded float checkpoint '%s'.\n", CKPT_PATH);
+        else
+            printf("No float checkpoint '%s' — quantizing current (untrained) weights.\n",
+                   CKPT_PATH);
+        if (!save_quant(out, qmode)) {
+            fprintf(stderr, "quantize: failed to write '%s'\n", out);
+            return 1;
+        }
+        struct stat sf, sq;
+        long params = (long)(VOCAB*EMBED + NUM_LAYERS*NGATE*(2*HIDDEN*HIDDEN + HIDDEN)
+                             + VOCAB*HIDDEN + VOCAB);
+        printf("Quantized to %s and wrote '%s'.\n", qmode == 1 ? "1-bit" : "int8", out);
+        printf("  params: %ld   (~%.2f bytes/param in this file)\n", params,
+               stat(out, &sq) == 0 ? (double)sq.st_size / (double)params : 0.0);
+        if (stat(CKPT_PATH, &sf) == 0 && stat(out, &sq) == 0 && sq.st_size > 0)
+            printf("  float checkpoint: %.1f MB  ->  quantized: %.1f MB  (%.1fx smaller)\n",
+                   sf.st_size / 1e6, sq.st_size / 1e6, (double)sf.st_size / (double)sq.st_size);
+        printf("  your float checkpoint '%s' is untouched.\n", CKPT_PATH);
+        return 0;
+    }
+    if (argc >= 3 && strcmp(argv[1], "--sample-quant") == 0) {
+        if (!load_quant(argv[2])) {
+            fprintf(stderr, "cannot load quantized model '%s' (wrong format or arch)\n", argv[2]);
+            return 1;
+        }
+        int n = (argc >= 4) ? atoi(argv[3]) : 200;
+        if (n <= 0) n = 200;
+        printf("Loaded quantized model '%s'. Sample (seeded 't'):\n  \"", argv[2]);
+        sample('t', n);
+        printf("\"\n");
+        return 0;
+    }
 
     int loaded = load_model(CKPT_PATH);
     if (loaded) printf("Loaded checkpoint '%s' — continuing to learn.\n", CKPT_PATH);

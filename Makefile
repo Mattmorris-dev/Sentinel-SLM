@@ -9,9 +9,9 @@ CFLAGS  ?= -O2 -Wall
 LDLIBS   = -lm
 BIN      = sentinel
 PREFIX  ?= /usr/local
-VERSION ?= 0.3.0
+VERSION ?= 0.4.0
 
-.PHONY: all both slm huge run train fetch quick-fetch clean distclean install uninstall package help
+.PHONY: all both slm huge run train quant fetch quick-fetch clean distclean install uninstall package help
 
 all: $(BIN)            ## build the default ~50M model (plain gcc, runs anywhere)
 
@@ -36,6 +36,9 @@ run: $(BIN)            ## train on the built-in corpus, then serve the read/agen
 train: $(BIN)          ## train on ./corpus (run `make fetch` first)
 	./$(BIN) --train corpus
 
+quant: $(BIN)          ## export small quantized models (int8 ~8x, 1bit ~64x) — float ckpt untouched
+	./$(BIN) --quantize int8 && ./$(BIN) --quantize 1bit
+
 fetch:                 ## download the full real-world corpus (security/coding/CVE)
 	./fetch_corpus.sh
 
@@ -43,7 +46,7 @@ quick-fetch:           ## download a small/fast demo corpus
 	QUICK=1 ./fetch_corpus.sh
 
 clean:                 ## remove the binary and checkpoint
-	rm -f $(BIN) sentinel.bin
+	rm -f $(BIN) sentinel.bin sentinel-int8.bin sentinel-1bit.bin
 
 distclean: clean       ## also remove the fetched corpus
 	rm -rf corpus

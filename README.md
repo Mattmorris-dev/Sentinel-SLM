@@ -63,6 +63,29 @@ hand in standard C. It learns character/word statistics (not fluent prose); the 
 the **complete, dependency-free, fully local pipeline**: tokenizer → embedding → stacked
 GRU → BPTT/Adam → checkpointing → retrieval → process-spawning agents.
 
+## Shrink it to ship it — quantization
+
+The trained weights are 8-byte doubles, which is heavy to copy onto a Pi, a USB stick, or
+a microcontroller. Sentinel can export a compact **quantized** copy of the model without
+touching your float checkpoint:
+
+```bash
+make quant                       # writes sentinel-int8.bin and sentinel-1bit.bin
+./sentinel --quantize int8       # int8  — per-row scale,  ~8x smaller than the weights
+./sentinel --quantize 1bit       # 1-bit — sign + per-row magnitude (BinaryConnect style)
+./sentinel --sample-quant sentinel-int8.bin 200   # verify the small model still generates
+```
+
+| Format | Bytes/param | vs. float weights | Quality |
+|---|---|---|---|
+| `int8` | ~1.0 | ~8x smaller | keeps ~all of it — **recommended** |
+| `1bit` | ~0.13 | ~64x smaller | lossy; use only to squeeze onto tiny hardware |
+
+Honest note: quantization makes the file **smaller**, not the model **smarter**. `int8` is
+the sweet spot. True 1-bit only approaches full quality at billion-parameter scale with
+quantization-aware training; at this size it trades real accuracy for size. The float
+checkpoint (`sentinel.bin`) is never modified by either export.
+
 ## See it run
 
 ```sh
