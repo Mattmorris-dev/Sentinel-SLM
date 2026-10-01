@@ -70,6 +70,10 @@
 #define SEQ_LEN     32      /* BPTT unroll length                       */
 #endif
 #define LR          0.002   /* base learning rate (Adam)                */
+#define WARMUP      200     /* linear LR warmup steps (0 -> LR) for a    */
+                            /* fresh model; stabilises early training,   */
+                            /* then holds constant so online learning    */
+                            /* keeps working across runs.                */
 #define CLIP        5.0     /* gradient clipping bound                  */
 #define ADAM_B1     0.9     /* Adam first-moment decay                  */
 #define ADAM_B2     0.999   /* Adam second-moment decay                 */
@@ -238,7 +242,7 @@ static void init_weights(void) {
 /* Adam update with bias correction.  bc1 = 1-B1^t, bc2 = 1-B2^t are passed in
  * so they're computed once per step, not once per weight. */
 static void adam(double *p, double *g, double *m, double *v, int n,
-                 double bc1, double bc2) {
+                 double bc1, double bc2, double lr) {
     for (int i = 0; i < n; i++) {
         double grad = g[i];
         if (grad >  CLIP) grad =  CLIP;
@@ -247,7 +251,7 @@ static void adam(double *p, double *g, double *m, double *v, int n,
         v[i] = ADAM_B2 * v[i] + (1.0 - ADAM_B2) * grad * grad;
         double mhat = m[i] / bc1;
         double vhat = v[i] / bc2;
-        p[i] -= LR * mhat / (sqrt(vhat) + ADAM_EPS);
+        p[i] -= lr * mhat / (sqrt(vhat) + ADAM_EPS);
     }
 }
 
@@ -281,15 +285,18 @@ static void apply_adam(void) {
     g_adam_t++;
     double bc1 = 1.0 - pow(ADAM_B1, (double)g_adam_t);
     double bc2 = 1.0 - pow(ADAM_B2, (double)g_adam_t);
-    adam(&Wemb[0][0], &dWemb[0][0], &mWemb[0][0], &vWemb[0][0], VOCAB * EMBED, bc1, bc2);
-    adam(&Why[0][0],  &dWhy[0][0],  &mWhy[0][0],  &vWhy[0][0],  VOCAB * HIDDEN, bc1, bc2);
-    adam(by, dby, mby, vby, VOCAB, bc1, bc2);
+    /* linear warmup for a fresh model (g_adam_t small); a resumed checkpoint
+     * has a large g_adam_t, so it trains at full LR immediately. */
+    double lr = (g_adam_t < WARMUP) ? LR * (double)g_adam_t / (double)WARMUP : LR;
+    adam(&Wemb[0][0], &dWemb[0][0], &mWemb[0][0], &vWemb[0][0], VOCAB * EMBED, bc1, bc2, lr);
+    adam(&Why[0][0],  &dWhy[0][0],  &mWhy[0][0],  &vWhy[0][0],  VOCAB * HIDDEN, bc1, bc2, lr);
+    adam(by, dby, mby, vby, VOCAB, bc1, bc2, lr);
     for (int l = 0; l < NUM_LAYERS; l++) {
         adam(&Wg[l][0][0][0], &dWg[l][0][0][0], &mWg[l][0][0][0], &vWg[l][0][0][0],
-             NGATE * HIDDEN * HIDDEN, bc1, bc2);
+             NGATE * HIDDEN * HIDDEN, bc1, bc2, lr);
         adam(&Ug[l][0][0][0], &dUg[l][0][0][0], &mUg[l][0][0][0], &vUg[l][0][0][0],
-             NGATE * HIDDEN * HIDDEN, bc1, bc2);
-        adam(&bg[l][0][0], &dbg[l][0][0], &mbg[l][0][0], &vbg[l][0][0], NGATE * HIDDEN, bc1, bc2);
+             NGATE * HIDDEN * HIDDEN, bc1, bc2, lr);
+        adam(&bg[l][0][0], &dbg[l][0][0], &mbg[l][0][0], &vbg[l][0][0], NGATE * HIDDEN, bc1, bc2, lr);
     }
 }
 
