@@ -92,6 +92,17 @@
  * switch double->float (halves RAM, speeds matmuls). VOCAB must stay a power
  * of two (the tokenizer masks with VOCAB-1). Dimension-generic otherwise. */
 
+/* Optional weight tying (-DTIE_WEIGHTS): reuse the input embedding as the
+ * output projection (a classic LM trick — the embedding gets gradient signal
+ * from both the input and the output, usually improving it). It requires the
+ * embedding to be hidden-width so the shapes match; no new arrays, no change
+ * to the checkpoint format (the now-unused Why is just ignored). */
+#ifdef TIE_WEIGHTS
+# if EMBED != HIDDEN
+#  error "TIE_WEIGHTS requires EMBED == HIDDEN (e.g. -DHIDDEN=256 -DEMBED=256)"
+# endif
+#endif
+
 #define CKPT_MAGIC  0x534C4D33u   /* "SLM3" — GRU + Adam checkpoint format */
 #ifndef CKPT_PATH
 #define CKPT_PATH   "sentinel.bin"
@@ -99,7 +110,7 @@
 #ifndef CKPT_EVERY
 #define CKPT_EVERY  2000    /* auto-save every N iters of a long training run, */
 #endif                      /* so an interrupted multi-hour train isn't lost   */
-#define VERSION     "0.5.1"
+#define VERSION     "0.5.2"
 
 /* ------------------------------------------------------------------ */
 /*  Parameters — a stacked GRU (gated recurrent unit) network.         */
@@ -346,7 +357,11 @@ static double train_step(const int *inputs, const int *targets,
                 g_h[l][t + 1][i] = (1.0 - g_z[l][t][i]) * g_n[l][t][i]
                                    + g_z[l][t][i] * hp[i];
         }
+#ifdef TIE_WEIGHTS
+        matvec(g_y[t], &Wemb[0][0], g_h[NUM_LAYERS - 1][t + 1], VOCAB, HIDDEN);
+#else
         matvec(g_y[t], &Why[0][0], g_h[NUM_LAYERS - 1][t + 1], VOCAB, HIDDEN);
+#endif
         for (int i = 0; i < VOCAB; i++) g_y[t][i] += by[i];
         softmax(g_p[t], g_y[t], VOCAB);
         loss += -log(g_p[t][targets[t]] + 1e-12);
@@ -369,7 +384,11 @@ static double train_step(const int *inputs, const int *targets,
         for (int i = 0; i < VOCAB; i++) {
             double dyi = dy[i];
             dby[i] += dyi;
+#ifdef TIE_WEIGHTS
+            double *wr = &dWemb[i][0];   /* output grad flows into the embedding */
+#else
             double *wr = &dWhy[i][0];
+#endif
             for (int j = 0; j < HIDDEN; j++) wr[j] += dyi * top[j];
         }
 
@@ -378,7 +397,11 @@ static double train_step(const int *inputs, const int *targets,
             for (int i = 0; i < HIDDEN; i++) dhtot[l][i] = dh_next[l][i];
         for (int j = 0; j < HIDDEN; j++) {
             double s = 0.0;
+#ifdef TIE_WEIGHTS
+            for (int i = 0; i < VOCAB; i++) s += Wemb[i][j] * dy[i];
+#else
             for (int i = 0; i < VOCAB; i++) s += Why[i][j] * dy[i];
+#endif
             dhtot[NUM_LAYERS - 1][j] += s;
         }
 
@@ -475,6 +498,71 @@ static void train(const char *data, int data_len, int iters, int verbose) {
 }
 
 /* ------------------------------------------------------------------ */
+/*  Numerical gradient check — verify backprop against finite diffs.    */
+/*  Proves the hand-written gradients (and any new ones: tying, LN) are */
+/*  correct. Build tiny (e.g. HIDDEN=16 EMBED=8) and run --gradcheck.   */
+/* ------------------------------------------------------------------ */
+static double forward_loss(const int *inputs, const int *targets,
+                           double hprev0[NUM_LAYERS][HIDDEN]) {
+    double hp[NUM_LAYERS][HIDDEN];
+    memcpy(hp, hprev0, sizeof hp);
+    g_defer_adam = 1;
+    double L = train_step(inputs, targets, hp);   /* no weight update */
+    g_defer_adam = 0;
+    return L;
+}
+
+static void gradcheck(void) {
+    const char seed[] =
+        "the local slm studies cybersecurity and coding; a secure system validates input.";
+    if ((int)(sizeof seed - 1) < SEQ_LEN + 1) { printf("gradcheck: seed too short\n"); return; }
+    int inputs[SEQ_LEN], targets[SEQ_LEN];
+    for (int k = 0; k < SEQ_LEN; k++) {
+        inputs[k]  = (unsigned char)seed[k]     & (VOCAB - 1);
+        targets[k] = (unsigned char)seed[k + 1] & (VOCAB - 1);
+    }
+    double hprev0[NUM_LAYERS][HIDDEN];
+    memset(hprev0, 0, sizeof hprev0);
+
+    /* analytic gradients from one backward pass */
+    double hp[NUM_LAYERS][HIDDEN];
+    memcpy(hp, hprev0, sizeof hp);
+    g_defer_adam = 1;
+    train_step(inputs, targets, hp);
+    g_defer_adam = 0;
+
+    struct { double *w; double g; const char *name; } probes[] = {
+        { &Wg[0][GZ][0][0], dWg[0][GZ][0][0], "Wg[0][GZ][0][0]" },
+        { &Wg[0][GN][1][2], dWg[0][GN][1][2], "Wg[0][GN][1][2]" },
+        { &Ug[0][GR][2][1], dUg[0][GR][2][1], "Ug[0][GR][2][1]" },
+        { &Wemb[inputs[0]][0], dWemb[inputs[0]][0], "Wemb[tok][0]" },
+        { &Why[1][3], dWhy[1][3], "Why[1][3]" },
+        { &by[2], dby[2], "by[2]" },
+        { &bg[0][GZ][4], dbg[0][GZ][4], "bg[0][GZ][4]" },
+    };
+    int np = (int)(sizeof probes / sizeof probes[0]);
+    double eps = 1e-5;
+    int fail = 0;
+    printf("gradcheck (eps=%.0e):\n", eps);
+    for (int i = 0; i < np; i++) {
+        double *w = probes[i].w, orig = *w, a = probes[i].g;
+        *w = orig + eps; double Lp = forward_loss(inputs, targets, hprev0);
+        *w = orig - eps; double Lm = forward_loss(inputs, targets, hprev0);
+        *w = orig;
+        double num = (Lp - Lm) / (2.0 * eps);
+        double adiff = fabs(a - num);
+        double rel = adiff / (fabs(a) + fabs(num) + 1e-12);
+        /* a gradient is wrong only if BOTH the relative and absolute error are
+         * large; near-zero gradients fail relative error on FP noise alone. */
+        int bad = (rel > 1e-4 && adiff > 1e-7);
+        if (bad) fail = 1;
+        printf("  %-18s analytic=% .6e  numeric=% .6e  relerr=%.2e%s\n",
+               probes[i].name, a, num, rel, bad ? "  <-- BAD" : "");
+    }
+    printf("gradcheck  ->  %s\n", fail ? "FAIL" : "PASS");
+}
+
+/* ------------------------------------------------------------------ */
 /*  Generate text by sampling the model character by character.        */
 /* ------------------------------------------------------------------ */
 static void sample(int seed, int n) {
@@ -509,7 +597,11 @@ static void sample(int seed, int n) {
         }
         for (int l = 0; l < NUM_LAYERS; l++)
             for (int i = 0; i < HIDDEN; i++) h[l][i] = hnew[l][i];
+#ifdef TIE_WEIGHTS
+        matvec(y, &Wemb[0][0], h[NUM_LAYERS - 1], VOCAB, HIDDEN);
+#else
         matvec(y, &Why[0][0], h[NUM_LAYERS - 1], VOCAB, HIDDEN);
+#endif
         for (int i = 0; i < VOCAB; i++) y[i] += by[i];
         softmax(p, y, VOCAB);
 
@@ -1708,6 +1800,7 @@ static void print_usage(const char *prog) {
 "  %s --self-study [rounds]\n"
 "                            OPT-IN: the model asks Opus for ideas and LEARNS from\n"
 "                            the answers (updates its weights, never its code)\n"
+"  %s --gradcheck          numerically verify backprop (build tiny first)\n"
 "  %s --help | -h          show this help\n"
 "  %s --version            print version\n"
 "\n"
@@ -1744,7 +1837,7 @@ static void print_usage(const char *prog) {
 "  Sub-agents run real shell commands but a hard guard refuses 'sudo' and\n"
 "  destructive patterns (rm -rf /, mkfs, dd, fork bombs, shutdown, ...).\n"
 "  Set SLM_NO_EXEC=1 to disable command execution entirely.\n",
-        VERSION, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog);
+        VERSION, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog);
 }
 
 int main(int argc, char **argv) {
@@ -1791,6 +1884,8 @@ int main(int argc, char **argv) {
 
     srand(1234567u);
     init_weights();
+
+    if (argc >= 2 && strcmp(argv[1], "--gradcheck") == 0) { gradcheck(); return 0; }
 
     /* ---- quantized export (non-destructive) and quantized-sample verify ---- */
     if (argc >= 3 && strcmp(argv[1], "--quantize") == 0) {
