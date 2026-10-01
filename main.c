@@ -96,7 +96,10 @@
 #ifndef CKPT_PATH
 #define CKPT_PATH   "sentinel.bin"
 #endif
-#define VERSION     "0.5.0"
+#ifndef CKPT_EVERY
+#define CKPT_EVERY  2000    /* auto-save every N iters of a long training run, */
+#endif                      /* so an interrupted multi-hour train isn't lost   */
+#define VERSION     "0.5.1"
 
 /* ------------------------------------------------------------------ */
 /*  Parameters — a stacked GRU (gated recurrent unit) network.         */
@@ -141,6 +144,7 @@ static double vWhy [VOCAB][HIDDEN];
 static double vby  [VOCAB];
 
 static long g_adam_t = 0;   /* Adam timestep, for bias correction */
+static double g_lr = LR;    /* effective learning rate (override via SLM_LR) */
 static int  g_defer_adam = 0;  /* when set, train_step computes grads but skips Adam
                                 * (used by quantization-aware training) */
 
@@ -287,7 +291,7 @@ static void apply_adam(void) {
     double bc2 = 1.0 - pow(ADAM_B2, (double)g_adam_t);
     /* linear warmup for a fresh model (g_adam_t small); a resumed checkpoint
      * has a large g_adam_t, so it trains at full LR immediately. */
-    double lr = (g_adam_t < WARMUP) ? LR * (double)g_adam_t / (double)WARMUP : LR;
+    double lr = (g_adam_t < WARMUP) ? g_lr * (double)g_adam_t / (double)WARMUP : g_lr;
     adam(&Wemb[0][0], &dWemb[0][0], &mWemb[0][0], &vWemb[0][0], VOCAB * EMBED, bc1, bc2, lr);
     adam(&Why[0][0],  &dWhy[0][0],  &mWhy[0][0],  &vWhy[0][0],  VOCAB * HIDDEN, bc1, bc2, lr);
     adam(by, dby, mby, vby, VOCAB, bc1, bc2, lr);
@@ -441,6 +445,8 @@ static double train_step(const int *inputs, const int *targets,
 /* ------------------------------------------------------------------ */
 /*  Train on a text buffer for a number of iterations.                 */
 /* ------------------------------------------------------------------ */
+static void save_model(const char *path);   /* defined below; used for auto-save */
+
 static void train(const char *data, int data_len, int iters, int verbose) {
     if (data_len < SEQ_LEN + 1) return;
     double hprev[NUM_LAYERS][HIDDEN];
@@ -461,6 +467,10 @@ static void train(const char *data, int data_len, int iters, int verbose) {
         p += SEQ_LEN;
         if (verbose && (it % 200 == 0 || it == iters - 1))
             printf("  iter %5d/%d   loss/char = %.4f\n", it, iters, smooth);
+        if (verbose && it > 0 && it % CKPT_EVERY == 0) {
+            save_model(CKPT_PATH);          /* crash-safety for long runs */
+            printf("  [auto-saved checkpoint at iter %d]\n", it);
+        }
     }
 }
 
@@ -815,6 +825,10 @@ static void qat_train(const char *data, int data_len, int iters, int qmode) {
         p += SEQ_LEN;
         if (it % 200 == 0 || it == iters - 1)
             printf("  qat iter %5d/%d   loss/char = %.4f\n", it, iters, smooth);
+        if (it > 0 && it % CKPT_EVERY == 0) {
+            save_model(CKPT_PATH);          /* crash-safety: save latent weights */
+            printf("  [auto-saved latent checkpoint at iter %d]\n", it);
+        }
     }
     free(sWemb); free(sWg); free(sUg); free(sWhy);
 }
@@ -1720,6 +1734,7 @@ static void print_usage(const char *prog) {
 "\n"
 "ENVIRONMENT VARIABLES\n"
 "  SLM_EPOCHS=N              training iterations (default 2000)\n"
+"  SLM_LR=F                  override the base learning rate (default 0.002)\n"
 "  SLM_NO_EXEC=1             agents PLAN ONLY — print commands, run nothing\n"
 "  ANTHROPIC_API_KEY=...     enables the OPT-IN online advisor (--ask-opus /\n"
 "                            --self-study). Unset = the core is 100%% local.\n"
@@ -1823,6 +1838,8 @@ int main(int argc, char **argv) {
     int iters = 2000;
     const char *env_ep = getenv("SLM_EPOCHS");
     if (env_ep) { int v = atoi(env_ep); if (v > 0) iters = v; }
+    const char *env_lr = getenv("SLM_LR");
+    if (env_lr) { double v = atof(env_lr); if (v > 0.0) g_lr = v; }
 
     /* ---- self-study: learn neural-net/security ideas from Opus (opt-in) ---- */
     if (argc >= 2 && strcmp(argv[1], "--self-study") == 0) {

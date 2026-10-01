@@ -9,7 +9,7 @@ CFLAGS  ?= -O2 -Wall
 LDLIBS   = -lm
 BIN      = sentinel
 PREFIX  ?= /usr/local
-VERSION ?= 0.5.0
+VERSION ?= 0.5.1
 
 .PHONY: all both slm huge run train quant pet-model fetch quick-fetch clean distclean install uninstall package help
 
