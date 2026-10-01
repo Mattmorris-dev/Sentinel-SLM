@@ -9,9 +9,9 @@ CFLAGS  ?= -O2 -Wall
 LDLIBS   = -lm
 BIN      = sentinel
 PREFIX  ?= /usr/local
-VERSION ?= 0.5.1
+VERSION ?= 0.6.0
 
-.PHONY: all both slm huge run train quant pet-model fetch quick-fetch clean distclean install uninstall package help
+.PHONY: all both slm huge ln gradcheck run train quant pet-model fetch quick-fetch clean distclean install uninstall package help
 
 all: $(BIN)            ## build the default ~50M model (plain gcc, runs anywhere)
 
@@ -31,6 +31,15 @@ slm: main.c            ## build a tiny SLM (sentinel-slm, ~1.2M params)
 huge: main.c           ## build the 8 GB Pi 5 flagship (sentinel-huge, ~142M params)
 	$(CC) -O2 -Wall -mcmodel=large -DHIDDEN=2816 \
 	    -DCKPT_PATH='"sentinel-huge.bin"' -o sentinel-huge main.c $(LDLIBS)
+
+ln: main.c             ## build with LayerNorm (sentinel-ln, faster convergence)
+	$(CC) -O2 -Wall -DUSE_LN -DHIDDEN=256 -DEMBED=64 -DNUM_LAYERS=2 \
+	    -DCKPT_PATH='"sentinel-ln.bin"' -o sentinel-ln main.c $(LDLIBS)
+
+gradcheck: main.c      ## numerically verify backprop (tiny build + --gradcheck)
+	$(CC) -O2 -Wall -DHIDDEN=16 -DEMBED=8 -DNUM_LAYERS=2 \
+	    -DCKPT_PATH='"/tmp/gc.bin"' -o sentinel-gradcheck main.c $(LDLIBS)
+	./sentinel-gradcheck --gradcheck
 
 both: $(BIN) slm       ## build the default model + the tiny SLM
 
@@ -64,7 +73,8 @@ quick-fetch:           ## download a small/fast demo corpus
 clean:                 ## remove the binary and checkpoint
 	rm -f $(BIN) sentinel.bin sentinel-int8.bin sentinel-1bit.bin \
 	    sentinel-pet-trainer sentinel-pet.bin sentinel-1bit-qat.bin \
-	    sentinel-int8-qat.bin export_model model.h
+	    sentinel-int8-qat.bin export_model model.h \
+	    sentinel-ln sentinel-ln.bin sentinel-gradcheck
 
 distclean: clean       ## also remove the fetched corpus
 	rm -rf corpus

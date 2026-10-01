@@ -103,14 +103,23 @@
 # endif
 #endif
 
+#ifdef USE_LN
+#define CKPT_MAGIC  0x534C4D34u   /* "SLM4" — GRU + Adam + LayerNorm gains */
+#else
 #define CKPT_MAGIC  0x534C4D33u   /* "SLM3" — GRU + Adam checkpoint format */
+#endif
 #ifndef CKPT_PATH
 #define CKPT_PATH   "sentinel.bin"
 #endif
 #ifndef CKPT_EVERY
 #define CKPT_EVERY  2000    /* auto-save every N iters of a long training run, */
 #endif                      /* so an interrupted multi-hour train isn't lost   */
-#define VERSION     "0.5.2"
+#define VERSION     "0.6.0"
+/* Optional build flags (all default OFF; the shipped model is unchanged):
+ *   -DUSE_LN        LayerNorm on the GRU gate pre-activations (faster/steadier
+ *                   convergence; adds a learnable gain gln, reuses bg as beta).
+ *   -DTIE_WEIGHTS   tie the output projection to the input embedding (needs
+ *                   EMBED==HIDDEN). Both are gradient-checked (--gradcheck). */
 
 /* ------------------------------------------------------------------ */
 /*  Parameters — a stacked GRU (gated recurrent unit) network.         */
@@ -154,6 +163,15 @@ static double vbg  [NUM_LAYERS][NGATE][HIDDEN];
 static double vWhy [VOCAB][HIDDEN];
 static double vby  [VOCAB];
 
+#ifdef USE_LN
+/* LayerNorm gain (gamma) per gate channel; the existing bg acts as the beta
+ * (post-norm shift). Added when built with -DUSE_LN. */
+static double gln [NUM_LAYERS][NGATE][HIDDEN];
+static double dgln[NUM_LAYERS][NGATE][HIDDEN];
+static double mgln[NUM_LAYERS][NGATE][HIDDEN];
+static double vgln[NUM_LAYERS][NGATE][HIDDEN];
+#endif
+
 static long g_adam_t = 0;   /* Adam timestep, for bias correction */
 static double g_lr = LR;    /* effective learning rate (override via SLM_LR) */
 static int  g_defer_adam = 0;  /* when set, train_step computes grads but skips Adam
@@ -169,6 +187,10 @@ static double g_n  [NUM_LAYERS][SEQ_LEN][HIDDEN];      /* candidate state       
 static double g_hr [NUM_LAYERS][SEQ_LEN][HIDDEN];      /* r (.) h_prev          */
 static double g_y  [SEQ_LEN][VOCAB];
 static double g_p  [SEQ_LEN][VOCAB];
+#ifdef USE_LN
+static double g_ln_nhat[NUM_LAYERS][NGATE][SEQ_LEN][HIDDEN];  /* normalized pre-act */
+static double g_ln_rstd[NUM_LAYERS][NGATE][SEQ_LEN];          /* 1/std per gate/step */
+#endif
 
 /* ------------------------------------------------------------------ */
 /*  Deterministic PRNG so the "static" default weights are reproducible.*/
@@ -247,6 +269,12 @@ static void init_weights(void) {
     memset(vWemb, 0, sizeof vWemb); memset(vWg, 0, sizeof vWg);
     memset(vUg, 0, sizeof vUg);     memset(vbg, 0, sizeof vbg);
     memset(vWhy, 0, sizeof vWhy);   memset(vby, 0, sizeof vby);
+#ifdef USE_LN
+    for (int l = 0; l < NUM_LAYERS; l++)
+        for (int gt = 0; gt < NGATE; gt++)
+            for (int i = 0; i < HIDDEN; i++) gln[l][gt][i] = 1.0;   /* identity scale */
+    memset(mgln, 0, sizeof mgln); memset(vgln, 0, sizeof vgln);
+#endif
     g_adam_t = 0;
 }
 
@@ -277,7 +305,9 @@ static void gate_backward(int l, int gt, const double *d, const double *xin,
                           const double *rec, double *dxin, double *drec) {
     for (int i = 0; i < HIDDEN; i++) {
         double di = d[i];
-        dbg[l][gt][i] += di;
+#ifndef USE_LN
+        dbg[l][gt][i] += di;        /* with LN the bias grad is handled post-norm */
+#endif
         double *wr = &dWg[l][gt][i][0];
         double *ur = &dUg[l][gt][i][0];
         for (int j = 0; j < HIDDEN; j++) { wr[j] += di * xin[j]; ur[j] += di * rec[j]; }
@@ -313,7 +343,45 @@ static void apply_adam(void) {
              NGATE * HIDDEN * HIDDEN, bc1, bc2, lr);
         adam(&bg[l][0][0], &dbg[l][0][0], &mbg[l][0][0], &vbg[l][0][0], NGATE * HIDDEN, bc1, bc2, lr);
     }
+#ifdef USE_LN
+    adam(&gln[0][0][0], &dgln[0][0][0], &mgln[0][0][0], &vgln[0][0][0],
+         NUM_LAYERS * NGATE * HIDDEN, bc1, bc2, lr);
+#endif
 }
+
+#ifdef USE_LN
+/* LayerNorm over a HIDDEN vector. Fills nhat=(v-μ)/σ, returns rstd=1/σ. */
+static double ln_forward(const double *v, double *nhat) {
+    double mu = 0.0;
+    for (int i = 0; i < HIDDEN; i++) mu += v[i];
+    mu /= HIDDEN;
+    double var = 0.0;
+    for (int i = 0; i < HIDDEN; i++) { double d = v[i] - mu; var += d * d; }
+    var /= HIDDEN;
+    double rstd = 1.0 / sqrt(var + 1e-5);
+    for (int i = 0; i < HIDDEN; i++) nhat[i] = (v[i] - mu) * rstd;
+    return rstd;
+}
+/* LayerNorm backward: given dnhat and cached nhat/rstd, fill dv (grad wrt v). */
+static void ln_backward(const double *dnhat, const double *nhat, double rstd, double *dv) {
+    double m1 = 0.0, m2 = 0.0;
+    for (int i = 0; i < HIDDEN; i++) { m1 += dnhat[i]; m2 += dnhat[i] * nhat[i]; }
+    m1 /= HIDDEN; m2 /= HIDDEN;
+    for (int i = 0; i < HIDDEN; i++) dv[i] = rstd * (dnhat[i] - m1 - nhat[i] * m2);
+}
+/* Turn d_a (grad wrt the post-norm activation a=γ⊙nhat+β) into dpre (grad wrt
+ * the pre-norm vector), accumulating the β (bg) and γ (gln) gradients. */
+static void ln_gate_back(int l, int gt, int t, const double *da, double *dpre) {
+    double dnhat[HIDDEN];
+    const double *nhat = g_ln_nhat[l][gt][t];
+    for (int i = 0; i < HIDDEN; i++) {
+        dbg[l][gt][i]  += da[i];
+        dgln[l][gt][i] += da[i] * nhat[i];
+        dnhat[i] = da[i] * gln[l][gt][i];
+    }
+    ln_backward(dnhat, nhat, g_ln_rstd[l][gt][t], dpre);
+}
+#endif
 
 static double train_step(const int *inputs, const int *targets,
                          double hprev[NUM_LAYERS][HIDDEN]) {
@@ -323,6 +391,9 @@ static double train_step(const int *inputs, const int *targets,
 
     double loss = 0.0;
     double xin[HIDDEN], wx[HIDDEN], uh[HIDDEN];
+#ifdef USE_LN
+    double pre[HIDDEN];
+#endif
     for (int t = 0; t < SEQ_LEN; t++) {
         int tok = inputs[t];
         g_in[t] = tok;
@@ -339,19 +410,40 @@ static double train_step(const int *inputs, const int *targets,
             /* update gate z */
             matvec(wx, &Wg[l][GZ][0][0], xin, HIDDEN, HIDDEN);
             matvec(uh, &Ug[l][GZ][0][0], hp,  HIDDEN, HIDDEN);
+#ifdef USE_LN
+            for (int i = 0; i < HIDDEN; i++) pre[i] = wx[i] + uh[i];
+            g_ln_rstd[l][GZ][t] = ln_forward(pre, g_ln_nhat[l][GZ][t]);
+            for (int i = 0; i < HIDDEN; i++)
+                g_z[l][t][i] = sigmoid(gln[l][GZ][i] * g_ln_nhat[l][GZ][t][i] + bg[l][GZ][i]);
+#else
             for (int i = 0; i < HIDDEN; i++)
                 g_z[l][t][i] = sigmoid(wx[i] + uh[i] + bg[l][GZ][i]);
+#endif
             /* reset gate r */
             matvec(wx, &Wg[l][GR][0][0], xin, HIDDEN, HIDDEN);
             matvec(uh, &Ug[l][GR][0][0], hp,  HIDDEN, HIDDEN);
+#ifdef USE_LN
+            for (int i = 0; i < HIDDEN; i++) pre[i] = wx[i] + uh[i];
+            g_ln_rstd[l][GR][t] = ln_forward(pre, g_ln_nhat[l][GR][t]);
+            for (int i = 0; i < HIDDEN; i++)
+                g_r[l][t][i] = sigmoid(gln[l][GR][i] * g_ln_nhat[l][GR][t][i] + bg[l][GR][i]);
+#else
             for (int i = 0; i < HIDDEN; i++)
                 g_r[l][t][i] = sigmoid(wx[i] + uh[i] + bg[l][GR][i]);
+#endif
             /* candidate n with reset-gated hidden: hr = r (.) h_prev */
             for (int i = 0; i < HIDDEN; i++) g_hr[l][t][i] = g_r[l][t][i] * hp[i];
             matvec(wx, &Wg[l][GN][0][0], xin,        HIDDEN, HIDDEN);
             matvec(uh, &Ug[l][GN][0][0], g_hr[l][t], HIDDEN, HIDDEN);
+#ifdef USE_LN
+            for (int i = 0; i < HIDDEN; i++) pre[i] = wx[i] + uh[i];
+            g_ln_rstd[l][GN][t] = ln_forward(pre, g_ln_nhat[l][GN][t]);
+            for (int i = 0; i < HIDDEN; i++)
+                g_n[l][t][i] = tanh(gln[l][GN][i] * g_ln_nhat[l][GN][t][i] + bg[l][GN][i]);
+#else
             for (int i = 0; i < HIDDEN; i++)
                 g_n[l][t][i] = tanh(wx[i] + uh[i] + bg[l][GN][i]);
+#endif
             /* new hidden: h = (1 - z) (.) n + z (.) h_prev */
             for (int i = 0; i < HIDDEN; i++)
                 g_h[l][t + 1][i] = (1.0 - g_z[l][t][i]) * g_n[l][t][i]
@@ -371,6 +463,9 @@ static double train_step(const int *inputs, const int *targets,
     memset(dWemb, 0, sizeof dWemb); memset(dWg, 0, sizeof dWg);
     memset(dUg, 0, sizeof dUg);     memset(dbg, 0, sizeof dbg);
     memset(dWhy, 0, sizeof dWhy);   memset(dby, 0, sizeof dby);
+#ifdef USE_LN
+    memset(dgln, 0, sizeof dgln);
+#endif
 
     double dh_next[NUM_LAYERS][HIDDEN];
     memset(dh_next, 0, sizeof dh_next);
@@ -423,6 +518,9 @@ static double train_step(const int *inputs, const int *targets,
             double dn[HIDDEN], dz[HIDDEN], dhp[HIDDEN];
             double dan[HIDDEN], daz[HIDDEN], dar[HIDDEN], dr[HIDDEN];
             double dxin[HIDDEN], drec[HIDDEN];
+#ifdef USE_LN
+            double dpre[HIDDEN];
+#endif
             for (int i = 0; i < HIDDEN; i++) {
                 dn[i]   = dh[i] * (1.0 - z[i]);
                 dz[i]   = dh[i] * (hp[i] - nn[i]);
@@ -431,18 +529,33 @@ static double train_step(const int *inputs, const int *targets,
             }
             /* candidate n = tanh(Wn x + Un hr + bn) */
             for (int i = 0; i < HIDDEN; i++) dan[i] = dn[i] * (1.0 - nn[i] * nn[i]);
+#ifdef USE_LN
+            ln_gate_back(l, GN, t, dan, dpre);
+            gate_backward(l, GN, dpre, xin, hr, dxin, drec);  /* drec = grad wrt hr */
+#else
             gate_backward(l, GN, dan, xin, hr, dxin, drec);   /* drec = grad wrt hr */
+#endif
             for (int i = 0; i < HIDDEN; i++) {
                 dr[i]   = drec[i] * hp[i];       /* hr = r (.) h_prev */
                 dhp[i] += drec[i] * r[i];
             }
             /* update gate z = sigmoid(...) */
             for (int i = 0; i < HIDDEN; i++) daz[i] = dz[i] * z[i] * (1.0 - z[i]);
+#ifdef USE_LN
+            ln_gate_back(l, GZ, t, daz, dpre);
+            gate_backward(l, GZ, dpre, xin, hp, dxin, drec);
+#else
             gate_backward(l, GZ, daz, xin, hp, dxin, drec);
+#endif
             for (int i = 0; i < HIDDEN; i++) dhp[i] += drec[i];
             /* reset gate r = sigmoid(...) */
             for (int i = 0; i < HIDDEN; i++) dar[i] = dr[i] * r[i] * (1.0 - r[i]);
+#ifdef USE_LN
+            ln_gate_back(l, GR, t, dar, dpre);
+            gate_backward(l, GR, dpre, xin, hp, dxin, drec);
+#else
             gate_backward(l, GR, dar, xin, hp, dxin, drec);
+#endif
             for (int i = 0; i < HIDDEN; i++) dhp[i] += drec[i];
 
             /* temporal gradient for t-1, and route the input gradient down */
@@ -539,6 +652,10 @@ static void gradcheck(void) {
         { &Why[1][3], dWhy[1][3], "Why[1][3]" },
         { &by[2], dby[2], "by[2]" },
         { &bg[0][GZ][4], dbg[0][GZ][4], "bg[0][GZ][4]" },
+#ifdef USE_LN
+        { &gln[0][GN][3], dgln[0][GN][3], "gln[0][GN][3]" },
+        { &gln[1][GZ][2], dgln[1][GZ][2], "gln[1][GZ][2]" },
+#endif
     };
     int np = (int)(sizeof probes / sizeof probes[0]);
     double eps = 1e-5;
@@ -570,6 +687,9 @@ static void sample(int seed, int n) {
     memset(h, 0, sizeof h);
     double xin[HIDDEN], wx[HIDDEN], uh[HIDDEN], hr[HIDDEN];
     double z[HIDDEN], rr[HIDDEN], nn[HIDDEN], emb[EMBED], y[VOCAB], p[VOCAB];
+#ifdef USE_LN
+    double pre[HIDDEN], nh[HIDDEN];
+#endif
     int tok = seed & (VOCAB - 1);
 
     for (int step = 0; step < n; step++) {
@@ -584,14 +704,32 @@ static void sample(int seed, int n) {
             }
             matvec(wx, &Wg[l][GZ][0][0], xin, HIDDEN, HIDDEN);
             matvec(uh, &Ug[l][GZ][0][0], hp,  HIDDEN, HIDDEN);
+#ifdef USE_LN
+            for (int i = 0; i < HIDDEN; i++) pre[i] = wx[i] + uh[i];
+            ln_forward(pre, nh);
+            for (int i = 0; i < HIDDEN; i++) z[i] = sigmoid(gln[l][GZ][i] * nh[i] + bg[l][GZ][i]);
+#else
             for (int i = 0; i < HIDDEN; i++) z[i]  = sigmoid(wx[i] + uh[i] + bg[l][GZ][i]);
+#endif
             matvec(wx, &Wg[l][GR][0][0], xin, HIDDEN, HIDDEN);
             matvec(uh, &Ug[l][GR][0][0], hp,  HIDDEN, HIDDEN);
+#ifdef USE_LN
+            for (int i = 0; i < HIDDEN; i++) pre[i] = wx[i] + uh[i];
+            ln_forward(pre, nh);
+            for (int i = 0; i < HIDDEN; i++) rr[i] = sigmoid(gln[l][GR][i] * nh[i] + bg[l][GR][i]);
+#else
             for (int i = 0; i < HIDDEN; i++) rr[i] = sigmoid(wx[i] + uh[i] + bg[l][GR][i]);
+#endif
             for (int i = 0; i < HIDDEN; i++) hr[i] = rr[i] * hp[i];
             matvec(wx, &Wg[l][GN][0][0], xin, HIDDEN, HIDDEN);
             matvec(uh, &Ug[l][GN][0][0], hr,  HIDDEN, HIDDEN);
+#ifdef USE_LN
+            for (int i = 0; i < HIDDEN; i++) pre[i] = wx[i] + uh[i];
+            ln_forward(pre, nh);
+            for (int i = 0; i < HIDDEN; i++) nn[i] = tanh(gln[l][GN][i] * nh[i] + bg[l][GN][i]);
+#else
             for (int i = 0; i < HIDDEN; i++) nn[i] = tanh(wx[i] + uh[i] + bg[l][GN][i]);
+#endif
             for (int i = 0; i < HIDDEN; i++)
                 hnew[l][i] = (1.0 - z[i]) * nn[i] + z[i] * hp[i];
         }
@@ -643,6 +781,11 @@ static void save_model(const char *path) {
     fwrite(vbg,   sizeof vbg,   1, f);
     fwrite(vWhy,  sizeof vWhy,  1, f);
     fwrite(vby,   sizeof vby,   1, f);
+#ifdef USE_LN
+    fwrite(gln,  sizeof gln,  1, f);
+    fwrite(mgln, sizeof mgln, 1, f);
+    fwrite(vgln, sizeof vgln, 1, f);
+#endif
     fwrite(&g_adam_t, sizeof g_adam_t, 1, f);
     fclose(f);
 }
@@ -676,6 +819,11 @@ static int load_model(const char *path) {
     ok &= fread(vbg,   sizeof vbg,   1, f) == 1;
     ok &= fread(vWhy,  sizeof vWhy,  1, f) == 1;
     ok &= fread(vby,   sizeof vby,   1, f) == 1;
+#ifdef USE_LN
+    ok &= fread(gln,  sizeof gln,  1, f) == 1;
+    ok &= fread(mgln, sizeof mgln, 1, f) == 1;
+    ok &= fread(vgln, sizeof vgln, 1, f) == 1;
+#endif
     ok &= fread(&g_adam_t, sizeof g_adam_t, 1, f) == 1;
     fclose(f);
     return ok;
