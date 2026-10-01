@@ -92,7 +92,7 @@
 #ifndef CKPT_PATH
 #define CKPT_PATH   "sentinel.bin"
 #endif
-#define VERSION     "0.4.0"
+#define VERSION     "0.5.0"
 
 /* ------------------------------------------------------------------ */
 /*  Parameters — a stacked GRU (gated recurrent unit) network.         */
@@ -703,6 +703,195 @@ static int load_quant(const char *path) {
     ok &= f32_read(f, by, VOCAB);
     fclose(f);
     return ok;
+}
+
+/* ================================================================== */
+/*  Optional online advisor — Sentinel can ask Claude Opus for safe,    */
+/*  structural neural-net / security ideas, and (opt-in) learn from the  */
+/*  answers.  This is the ONE part of Sentinel that talks to the cloud:  */
+/*                                                                      */
+/*    * OFF by default.  It does nothing unless ANTHROPIC_API_KEY is set */
+/*      AND you explicitly run --ask-opus / --self-study.  The core      */
+/*      stays 100% local.                                                */
+/*    * The question is JSON-escaped in C and written to a temp file, so */
+/*      it never passes through the shell (no injection).  The API key   */
+/*      is read from the environment by curl, never by this program.     */
+/*    * Opus output is only ever PRINTED or LEARNED FROM AS TEXT.  It is  */
+/*      never executed as a command and never rewrites Sentinel's source.*/
+/*      "Self-updating" here means the model updates its own WEIGHTS by   */
+/*      studying the answer — not its code.                              */
+/* ================================================================== */
+#define OPUS_MODEL_DEFAULT "claude-opus-5-5"
+#define OPUS_ENDPOINT      "https://api.anthropic.com/v1/messages"
+
+/* Escape a string for embedding inside a JSON string literal. */
+static void json_escape(const char *in, char *out, size_t outsz) {
+    size_t o = 0;
+    for (const unsigned char *p = (const unsigned char *)in; *p && o + 7 < outsz; p++) {
+        unsigned char c = *p;
+        switch (c) {
+            case '"':  out[o++] = '\\'; out[o++] = '"';  break;
+            case '\\': out[o++] = '\\'; out[o++] = '\\'; break;
+            case '\n': out[o++] = '\\'; out[o++] = 'n';  break;
+            case '\r': out[o++] = '\\'; out[o++] = 'r';  break;
+            case '\t': out[o++] = '\\'; out[o++] = 't';  break;
+            default:
+                if (c < 0x20) o += (size_t)snprintf(out + o, outsz - o, "\\u%04x", c);
+                else          out[o++] = (char)c;
+        }
+    }
+    out[o] = '\0';
+}
+
+/* Pull the first "type":"text" block's text out of an API response, undoing
+ * JSON string escapes.  Parsed in C (not the shell), so response content —
+ * whatever it is — can never be executed. */
+static int json_extract_text(const char *resp, char *out, size_t outsz) {
+    const char *t = strstr(resp, "\"type\":\"text\"");
+    const char *k = strstr(t ? t : resp, "\"text\":");
+    if (!k) return 0;
+    k = strchr(k + 7, '"');
+    if (!k) return 0;
+    k++;
+    size_t o = 0;
+    while (*k && o + 4 < outsz) {
+        if (*k == '"') break;                      /* end of the JSON string */
+        if (*k == '\\') {
+            k++;
+            switch (*k) {
+                case 'n': out[o++] = '\n'; break;
+                case 'r': out[o++] = '\r'; break;
+                case 't': out[o++] = '\t'; break;
+                case '"': out[o++] = '"';  break;
+                case '\\': out[o++] = '\\'; break;
+                case '/': out[o++] = '/';  break;
+                case 'u': {
+                    char hex[5] = { k[1], k[2], k[3], k[4], 0 };
+                    long cp = (k[1] && k[2] && k[3] && k[4]) ? strtol(hex, NULL, 16) : 0;
+                    if (cp < 0x80) out[o++] = (char)cp;
+                    else if (cp < 0x800) { out[o++] = (char)(0xC0 | (cp >> 6)); out[o++] = (char)(0x80 | (cp & 0x3F)); }
+                    else { out[o++] = (char)(0xE0 | (cp >> 12)); out[o++] = (char)(0x80 | ((cp >> 6) & 0x3F)); out[o++] = (char)(0x80 | (cp & 0x3F)); }
+                    if (k[1] && k[2] && k[3] && k[4]) k += 4;
+                    break;
+                }
+                default: out[o++] = *k; break;
+            }
+            if (*k) k++;
+        } else {
+            out[o++] = *k++;
+        }
+    }
+    out[o] = '\0';
+    return 1;
+}
+
+/* Ask Claude Opus a question; fill `answer`.  Returns 0 on success, -1 on any
+ * failure (no key, no network, no curl, empty response) with a message in
+ * `answer`.  Opt-in: does nothing without ANTHROPIC_API_KEY. */
+static int ask_opus(const char *question, const char *system_prompt,
+                    char *answer, size_t ansz) {
+    if (!getenv("ANTHROPIC_API_KEY")) {
+        snprintf(answer, ansz,
+                 "ANTHROPIC_API_KEY is not set. The online advisor is opt-in and off by "
+                 "default — run `export ANTHROPIC_API_KEY=...` to enable it.");
+        return -1;
+    }
+    const char *model = getenv("SENTINEL_OPUS_MODEL");
+    if (!model || !*model) model = OPUS_MODEL_DEFAULT;
+
+    char esc_q[8192], esc_s[2048], esc_m[128];
+    json_escape(question, esc_q, sizeof esc_q);
+    json_escape(system_prompt ? system_prompt : "", esc_s, sizeof esc_s);
+    json_escape(model, esc_m, sizeof esc_m);
+
+    char tmpl[] = "/tmp/sentinel_opus_XXXXXX";
+    int fd = mkstemp(tmpl);
+    if (fd < 0) { snprintf(answer, ansz, "could not create a temp request file"); return -1; }
+    FILE *bf = fdopen(fd, "w");
+    if (!bf) { close(fd); unlink(tmpl); snprintf(answer, ansz, "temp file error"); return -1; }
+    fprintf(bf,
+        "{\"model\":\"%s\",\"max_tokens\":1024,"
+        "\"system\":\"%s\","
+        "\"messages\":[{\"role\":\"user\",\"content\":\"%s\"}]}",
+        esc_m, esc_s, esc_q);
+    fclose(bf);
+
+    /* API key stays in the environment; only fixed strings + our temp path
+     * reach the shell. The request body is @file, so the question is never
+     * on the command line. */
+    char cmd[4096];
+    snprintf(cmd, sizeof cmd,
+        "curl -s --max-time 60 %s "
+        "-H 'content-type: application/json' "
+        "-H \"x-api-key: $ANTHROPIC_API_KEY\" "
+        "-H 'anthropic-version: 2023-06-01' "
+        "--data-binary @%s",
+        OPUS_ENDPOINT, tmpl);
+
+    FILE *pp = popen(cmd, "r");
+    if (!pp) { unlink(tmpl); snprintf(answer, ansz, "could not launch curl (is it installed?)"); return -1; }
+    static char resp[1 << 16];
+    size_t rn = fread(resp, 1, sizeof resp - 1, pp);
+    resp[rn] = '\0';
+    pclose(pp);
+    unlink(tmpl);
+
+    if (rn == 0) { snprintf(answer, ansz, "empty response (network blocked, or curl missing?)"); return -1; }
+    if (!json_extract_text(resp, answer, ansz)) {
+        const char *e = strstr(resp, "\"message\":");
+        snprintf(answer, ansz, "no text block in response. raw: %.700s", e ? e : resp);
+        return -1;
+    }
+    return 0;
+}
+
+/* Self-study loop: ask Opus a rotating set of safe neural-net / security
+ * questions and LEARN from each answer (online training on the answer text),
+ * checkpointing after each round.  The model updates its own weights — never
+ * its code.  Opt-in; stops immediately if the advisor is unavailable. */
+static int self_study(int rounds) {
+    static const char *QBANK[] = {
+        "In 3 short sentences, suggest one concrete, safe improvement to a character-level "
+        "stacked-GRU language model trained with Adam in pure C. Be specific and practical.",
+        "In 3 short sentences, explain gradient clipping and a good clip value for a small GRU, "
+        "and why it helps training stability.",
+        "In 3 short sentences, name one data-preprocessing or curriculum step that improves a "
+        "small, security-focused character-level language model.",
+        "In 3 short sentences, explain the tradeoff between widening (more hidden units) and "
+        "deepening (more layers) a small GRU for a fixed parameter budget.",
+        "In 3 short sentences, explain how int8 weight quantization keeps model quality while "
+        "shrinking the model, and one pitfall to avoid.",
+    };
+    int nq = (int)(sizeof QBANK / sizeof QBANK[0]);
+    const char *sys =
+        "You are a concise neural-network engineering tutor helping a small, local, pure-C "
+        "GRU language model understand how it can improve itself. Give short, practical, "
+        "safe, legal guidance only — no exploit code, no attack instructions.";
+    static char answer[1 << 16];
+    int learned = 0;
+    for (int r = 0; r < rounds; r++) {
+        const char *q = QBANK[r % nq];
+        printf("\n[self-study %d/%d] asking Opus:\n  Q: %s\n", r + 1, rounds, q);
+        fflush(stdout);
+        if (ask_opus(q, sys, answer, sizeof answer) != 0) {
+            printf("  ! advisor unavailable: %s\n", answer);
+            break;
+        }
+        printf("  A: %s\n", answer);
+        size_t al = strlen(answer);
+        if (al >= SEQ_LEN + 1) {
+            int iters = (int)(al / SEQ_LEN) * 4;
+            if (iters < 20) iters = 20;
+            train(answer, (int)al, iters, 0);
+            learned++;
+            printf("  [self-update] studied the answer (%zu chars, %d iters) and checkpointed.\n",
+                   al, iters);
+        }
+        save_model(CKPT_PATH);
+    }
+    printf("\n[self-study] updated the model from %d Opus answer(s); '%s' saved.\n",
+           learned, CKPT_PATH);
+    return learned;
 }
 
 /* ================================================================== */
@@ -1380,6 +1569,12 @@ static void print_usage(const char *prog) {
 "  %s --sample-quant <file> [n]\n"
 "                            load a quantized model and print an n-char sample\n"
 "                            (verify the small model still generates)\n"
+"  %s --ask-opus \"<question>\"\n"
+"                            OPT-IN online advisor: ask Claude Opus one safe\n"
+"                            neural-net/security question (needs ANTHROPIC_API_KEY)\n"
+"  %s --self-study [rounds]\n"
+"                            OPT-IN: the model asks Opus for ideas and LEARNS from\n"
+"                            the answers (updates its weights, never its code)\n"
 "  %s --help | -h          show this help\n"
 "  %s --version            print version\n"
 "\n"
@@ -1407,12 +1602,15 @@ static void print_usage(const char *prog) {
 "ENVIRONMENT VARIABLES\n"
 "  SLM_EPOCHS=N              training iterations (default 2000)\n"
 "  SLM_NO_EXEC=1             agents PLAN ONLY — print commands, run nothing\n"
+"  ANTHROPIC_API_KEY=...     enables the OPT-IN online advisor (--ask-opus /\n"
+"                            --self-study). Unset = the core is 100%% local.\n"
+"  SENTINEL_OPUS_MODEL=...   advisor model id (default claude-opus-5-5)\n"
 "\n"
 "SAFETY\n"
 "  Sub-agents run real shell commands but a hard guard refuses 'sudo' and\n"
 "  destructive patterns (rm -rf /, mkfs, dd, fork bombs, shutdown, ...).\n"
 "  Set SLM_NO_EXEC=1 to disable command execution entirely.\n",
-        VERSION, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog);
+        VERSION, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog);
 }
 
 int main(int argc, char **argv) {
@@ -1427,6 +1625,17 @@ int main(int argc, char **argv) {
                       strcmp(argv[1], "-v") == 0)) {
         printf("Sentinel v%s\n", VERSION);
         return 0;
+    }
+
+    /* ---- optional online advisor: ask Claude Opus one question (opt-in) ---- */
+    if (argc >= 3 && strcmp(argv[1], "--ask-opus") == 0) {
+        static char ans[1 << 16];
+        const char *sys =
+            "You are a concise neural-network and security engineering advisor for a small, "
+            "local, pure-C GRU model. Give short, practical, safe, legal guidance only.";
+        int rc = ask_opus(argv[2], sys, ans, sizeof ans);
+        printf("%s\n", ans);
+        return rc == 0 ? 0 : 1;
     }
 
     /* ---- sub-agent mode:  --agent <tier> <task>  (legacy:  --agent <task>) ---- */
@@ -1495,6 +1704,17 @@ int main(int argc, char **argv) {
     int iters = 2000;
     const char *env_ep = getenv("SLM_EPOCHS");
     if (env_ep) { int v = atoi(env_ep); if (v > 0) iters = v; }
+
+    /* ---- self-study: learn neural-net/security ideas from Opus (opt-in) ---- */
+    if (argc >= 2 && strcmp(argv[1], "--self-study") == 0) {
+        int rounds = (argc >= 3) ? atoi(argv[2]) : 3;
+        if (rounds < 1) rounds = 1;
+        if (rounds > 50) rounds = 50;
+        printf("=== self-study: the model asks Opus for ideas and learns from the answers ===\n");
+        printf("(opt-in online mode; the local core otherwise never phones home)\n");
+        self_study(rounds);
+        return 0;
+    }
 
     /* ---- external-corpus training mode (with data consolidation) ---- */
     if (argc >= 3 && strcmp(argv[1], "--train") == 0) {

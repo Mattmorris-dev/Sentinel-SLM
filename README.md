@@ -52,11 +52,16 @@ make && ./start.sh
 
 ## Runs on what you've got — pick a size
 
-| Build | Params | RAM | Flag | Hardware |
+| Build | Params | RAM (train) | Flag | Hardware |
 |---|---|---|---|---|
 | `make slm` | ~1.2M | 27 MB | none | a potato |
 | `make` (default) | ~58M | ~1.9 GB | none (plain gcc) | a Pi 4 / any laptop |
-| `make huge` | ~101M | ~3.2 GB | `-mcmodel=large` | an 8 GB Pi / a server |
+| `make huge` | ~143M | ~4.6 GB | `-mcmodel=large` | **8 GB Pi 5** (the flagship) / a server |
+
+Pick the biggest that fits your RAM — the model is dimension-generic, so one source
+scales from a microcontroller-class SLM to the 8 GB-Pi flagship. Training is CPU-bound
+and slow at the top end (hours), so train on a fast box and ship a quantized export (see
+below) to the Pi for fast, low-RAM inference.
 
 It's a genuine deep network with real weights, gradients, and GRU backprop — built by
 hand in standard C. It learns character/word statistics (not fluent prose); the power is
@@ -85,6 +90,31 @@ Honest note: quantization makes the file **smaller**, not the model **smarter**.
 the sweet spot. True 1-bit only approaches full quality at billion-parameter scale with
 quantization-aware training; at this size it trades real accuracy for size. The float
 checkpoint (`sentinel.bin`) is never modified by either export.
+
+## Optional online advisor — Sentinel can ask Opus for ideas (opt-in)
+
+Sentinel is **100% local by default and never phones home.** There is exactly one feature
+that reaches the cloud, and it is **off until you turn it on**: an optional advisor that
+lets the model ask Claude Opus for safe, structural neural-net / security guidance — and,
+if you want, learn from the answers.
+
+```bash
+export ANTHROPIC_API_KEY=...                    # required — unset = fully local, no network
+./sentinel --ask-opus "how should I tune my GRU's learning rate?"
+./sentinel --self-study 5                        # ask Opus 5 questions, LEARN from each answer
+```
+
+- `--ask-opus "<q>"` asks one question and prints the answer.
+- `--self-study [rounds]` is the **self-updating** loop: the model asks Opus a rotating set
+  of architecture questions and trains on each answer, then checkpoints. It updates its own
+  **weights** — never its own code. Opus's output is only ever printed or learned from as
+  text; it is **never executed as a command**.
+
+Safety and privacy by design: the request is built and escaped in C and sent via `curl`
+with the body in a file, so your question never touches a shell; the API key is read from
+the environment by `curl`, never handled by Sentinel. No key set → the advisor does nothing
+and the core stays entirely offline. (`SENTINEL_OPUS_MODEL` overrides the model; default
+`claude-opus-5-5`.)
 
 ## See it run
 

@@ -9,7 +9,7 @@ CFLAGS  ?= -O2 -Wall
 LDLIBS   = -lm
 BIN      = sentinel
 PREFIX  ?= /usr/local
-VERSION ?= 0.4.0
+VERSION ?= 0.5.0
 
 .PHONY: all both slm huge run train quant fetch quick-fetch clean distclean install uninstall package help
 
@@ -23,9 +23,13 @@ slm: main.c            ## build a tiny SLM (sentinel-slm, ~1.2M params)
 	$(CC) -O2 -Wall -DHIDDEN=256 -DEMBED=64 -DNUM_LAYERS=2 \
 	    -DCKPT_PATH='"sentinel-slm.bin"' -o sentinel-slm main.c $(LDLIBS)
 
-# The big model (~101M params, ~3.2 GB) — needs the large code model.
-huge: main.c           ## build the 101M model (sentinel-huge, needs 8 GB RAM)
-	$(CC) -O2 -Wall -mcmodel=large -DHIDDEN=2368 \
+# The flagship model, sized to MAX OUT an 8 GB Raspberry Pi 5 (the biggest Pi):
+# ~142M params, ~4.6 GB to train (Adam ~32 B/param), leaving headroom for the OS.
+# Needs the large code model (>2 GB static arrays). Train on a fast box if you
+# can — a real train at this width takes many CPU-hours — then ship an int8
+# export (`make quant`) to the Pi for fast, low-RAM inference.
+huge: main.c           ## build the 8 GB Pi 5 flagship (sentinel-huge, ~142M params)
+	$(CC) -O2 -Wall -mcmodel=large -DHIDDEN=2816 \
 	    -DCKPT_PATH='"sentinel-huge.bin"' -o sentinel-huge main.c $(LDLIBS)
 
 both: $(BIN) slm       ## build the default model + the tiny SLM
