@@ -137,6 +137,8 @@ static double vWhy [VOCAB][HIDDEN];
 static double vby  [VOCAB];
 
 static long g_adam_t = 0;   /* Adam timestep, for bias correction */
+static int  g_defer_adam = 0;  /* when set, train_step computes grads but skips Adam
+                                * (used by quantization-aware training) */
 
 /* Per-timestep activation cache used by backprop-through-time. */
 static int    g_in [SEQ_LEN];
@@ -272,6 +274,25 @@ static void gate_backward(int l, int gt, const double *d, const double *xin,
     }
 }
 
+/* Apply one Adam step to every parameter from the accumulated gradients.
+ * Split out of train_step so quantization-aware training can run the
+ * forward/backward on quantized weights but apply Adam to the latent ones. */
+static void apply_adam(void) {
+    g_adam_t++;
+    double bc1 = 1.0 - pow(ADAM_B1, (double)g_adam_t);
+    double bc2 = 1.0 - pow(ADAM_B2, (double)g_adam_t);
+    adam(&Wemb[0][0], &dWemb[0][0], &mWemb[0][0], &vWemb[0][0], VOCAB * EMBED, bc1, bc2);
+    adam(&Why[0][0],  &dWhy[0][0],  &mWhy[0][0],  &vWhy[0][0],  VOCAB * HIDDEN, bc1, bc2);
+    adam(by, dby, mby, vby, VOCAB, bc1, bc2);
+    for (int l = 0; l < NUM_LAYERS; l++) {
+        adam(&Wg[l][0][0][0], &dWg[l][0][0][0], &mWg[l][0][0][0], &vWg[l][0][0][0],
+             NGATE * HIDDEN * HIDDEN, bc1, bc2);
+        adam(&Ug[l][0][0][0], &dUg[l][0][0][0], &mUg[l][0][0][0], &vUg[l][0][0][0],
+             NGATE * HIDDEN * HIDDEN, bc1, bc2);
+        adam(&bg[l][0][0], &dbg[l][0][0], &mbg[l][0][0], &vbg[l][0][0], NGATE * HIDDEN, bc1, bc2);
+    }
+}
+
 static double train_step(const int *inputs, const int *targets,
                          double hprev[NUM_LAYERS][HIDDEN]) {
     /* ---- forward ---- */
@@ -401,20 +422,8 @@ static double train_step(const int *inputs, const int *targets,
         }
     }
 
-    /* ---- Adam update (bias-correction factors computed once per step) ---- */
-    g_adam_t++;
-    double bc1 = 1.0 - pow(ADAM_B1, (double)g_adam_t);
-    double bc2 = 1.0 - pow(ADAM_B2, (double)g_adam_t);
-    adam(&Wemb[0][0], &dWemb[0][0], &mWemb[0][0], &vWemb[0][0], VOCAB * EMBED, bc1, bc2);
-    adam(&Why[0][0],  &dWhy[0][0],  &mWhy[0][0],  &vWhy[0][0],  VOCAB * HIDDEN, bc1, bc2);
-    adam(by, dby, mby, vby, VOCAB, bc1, bc2);
-    for (int l = 0; l < NUM_LAYERS; l++) {
-        adam(&Wg[l][0][0][0], &dWg[l][0][0][0], &mWg[l][0][0][0], &vWg[l][0][0][0],
-             NGATE * HIDDEN * HIDDEN, bc1, bc2);
-        adam(&Ug[l][0][0][0], &dUg[l][0][0][0], &mUg[l][0][0][0], &vUg[l][0][0][0],
-             NGATE * HIDDEN * HIDDEN, bc1, bc2);
-        adam(&bg[l][0][0], &dbg[l][0][0], &mbg[l][0][0], &vbg[l][0][0], NGATE * HIDDEN, bc1, bc2);
-    }
+    /* ---- Adam update (deferred during quantization-aware training) ---- */
+    if (!g_defer_adam) apply_adam();
 
     /* carry the last hidden state forward (continuous, no context limit) */
     for (int l = 0; l < NUM_LAYERS; l++)
@@ -703,6 +712,104 @@ static int load_quant(const char *path) {
     ok &= f32_read(f, by, VOCAB);
     fclose(f);
     return ok;
+}
+
+/* ================================================================== */
+/*  Quantization-aware training (QAT) — make a 1-bit / int8 model that   */
+/*  is actually GOOD, not just small.                                    */
+/*                                                                      */
+/*  Plain quantization (above) rounds a finished float model and loses   */
+/*  quality.  QAT instead trains the model to survive quantization: on   */
+/*  every step the forward+backward pass runs on FAKE-QUANTIZED weights  */
+/*  (so the model "sees" the low precision it will be deployed at), but  */
+/*  Adam updates the full-precision LATENT weights.  Gradients flow      */
+/*  through the quantizer via the straight-through estimator (treat the  */
+/*  round/sign as identity in the backward pass).  Over training the     */
+/*  latent weights move to values whose quantized form still works —     */
+/*  this is the only way to get a genuinely strong 1-bit model.          */
+/* ================================================================== */
+
+/* In-place "fake quantize": round each row to the target precision and
+ * immediately expand back to double (quantize->dequantize), so the forward
+ * pass uses exactly the values the deployed model will. */
+static void fake_quant_tensor(double *M, int rows, int cols, int qmode) {
+    for (int i = 0; i < rows; i++) {
+        double *row = M + (size_t)i * cols;
+        if (qmode == 8) {
+            double mx = 0.0;
+            for (int j = 0; j < cols; j++) { double a = fabs(row[j]); if (a > mx) mx = a; }
+            double scale = (mx > 0.0) ? mx / 127.0 : 1.0;
+            for (int j = 0; j < cols; j++) {
+                long v = lround(row[j] / scale);
+                if (v >  127) v =  127;
+                if (v < -127) v = -127;
+                row[j] = (double)v * scale;
+            }
+        } else {
+            double s = 0.0;
+            for (int j = 0; j < cols; j++) s += fabs(row[j]);
+            double alpha = (cols > 0 && s > 0.0) ? s / cols : 1.0;
+            for (int j = 0; j < cols; j++) row[j] = (row[j] >= 0.0) ? alpha : -alpha;
+        }
+    }
+}
+
+/* Fake-quantize every weight matrix we export (biases stay full precision). */
+static void fake_quant_all(int qmode) {
+    fake_quant_tensor(&Wemb[0][0], VOCAB, EMBED, qmode);
+    for (int l = 0; l < NUM_LAYERS; l++)
+        for (int g = 0; g < NGATE; g++) {
+            fake_quant_tensor(&Wg[l][g][0][0], HIDDEN, HIDDEN, qmode);
+            fake_quant_tensor(&Ug[l][g][0][0], HIDDEN, HIDDEN, qmode);
+        }
+    fake_quant_tensor(&Why[0][0], VOCAB, HIDDEN, qmode);
+}
+
+/* One QAT step: back up latent weights, fake-quantize in place, run
+ * forward+backward (grads only), restore latent, then Adam-update the latent
+ * weights with the straight-through gradients. */
+static double qat_step(const int *in, const int *tg, double hprev[NUM_LAYERS][HIDDEN],
+                       int qmode, double *sWemb, double *sWg, double *sUg, double *sWhy) {
+    memcpy(sWemb, Wemb, sizeof Wemb); memcpy(sWg, Wg, sizeof Wg);
+    memcpy(sUg,   Ug,   sizeof Ug);   memcpy(sWhy, Why, sizeof Why);
+    fake_quant_all(qmode);                       /* globals -> effective (quantized) */
+    g_defer_adam = 1;
+    double loss = train_step(in, tg, hprev);     /* forward+backward, no Adam */
+    g_defer_adam = 0;
+    memcpy(Wemb, sWemb, sizeof Wemb); memcpy(Wg, sWg, sizeof Wg);
+    memcpy(Ug,   sUg,   sizeof Ug);   memcpy(Why, sWhy, sizeof Why);   /* restore latent */
+    apply_adam();                                /* update latent via straight-through grads */
+    return loss;
+}
+
+/* Train `iters` steps with QAT at the given precision.  Shadow (latent backup)
+ * is heap-allocated, so it never counts against the 2 GB static-data limit. */
+static void qat_train(const char *data, int data_len, int iters, int qmode) {
+    if (data_len < SEQ_LEN + 1) { fprintf(stderr, "QAT: corpus too small\n"); return; }
+    double *sWemb = malloc(sizeof Wemb), *sWg = malloc(sizeof Wg);
+    double *sUg   = malloc(sizeof Ug),   *sWhy = malloc(sizeof Why);
+    if (!sWemb || !sWg || !sUg || !sWhy) {
+        fprintf(stderr, "QAT: out of memory for shadow weights\n");
+        free(sWemb); free(sWg); free(sUg); free(sWhy); return;
+    }
+    double hprev[NUM_LAYERS][HIDDEN];
+    memset(hprev, 0, sizeof hprev);
+    int p = 0, inputs[SEQ_LEN], targets[SEQ_LEN];
+    double smooth = -1.0;
+    for (int it = 0; it < iters; it++) {
+        if (p + SEQ_LEN + 1 >= data_len) { p = 0; memset(hprev, 0, sizeof hprev); }
+        for (int k = 0; k < SEQ_LEN; k++) {
+            inputs[k]  = (unsigned char)data[p + k]     & (VOCAB - 1);
+            targets[k] = (unsigned char)data[p + k + 1] & (VOCAB - 1);
+        }
+        double loss = qat_step(inputs, targets, hprev, qmode, sWemb, sWg, sUg, sWhy);
+        double per_char = loss / SEQ_LEN;
+        smooth = (smooth < 0.0) ? per_char : 0.999 * smooth + 0.001 * per_char;
+        p += SEQ_LEN;
+        if (it % 200 == 0 || it == iters - 1)
+            printf("  qat iter %5d/%d   loss/char = %.4f\n", it, iters, smooth);
+    }
+    free(sWemb); free(sWg); free(sUg); free(sWhy);
 }
 
 /* ================================================================== */
@@ -1569,6 +1676,11 @@ static void print_usage(const char *prog) {
 "  %s --sample-quant <file> [n]\n"
 "                            load a quantized model and print an n-char sample\n"
 "                            (verify the small model still generates)\n"
+"  %s --quantize-train <int8|1bit> [corpus...]\n"
+"                            quantization-AWARE training: train a model that is\n"
+"                            actually GOOD at low precision (straight-through\n"
+"                            estimator). Writes a robust float ckpt + deployable\n"
+"                            quantized model. Iters via SLM_EPOCHS.\n"
 "  %s --ask-opus \"<question>\"\n"
 "                            OPT-IN online advisor: ask Claude Opus one safe\n"
 "                            neural-net/security question (needs ANTHROPIC_API_KEY)\n"
@@ -1610,7 +1722,7 @@ static void print_usage(const char *prog) {
 "  Sub-agents run real shell commands but a hard guard refuses 'sudo' and\n"
 "  destructive patterns (rm -rf /, mkfs, dd, fork bombs, shutdown, ...).\n"
 "  Set SLM_NO_EXEC=1 to disable command execution entirely.\n",
-        VERSION, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog);
+        VERSION, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog);
 }
 
 int main(int argc, char **argv) {
@@ -1713,6 +1825,37 @@ int main(int argc, char **argv) {
         printf("=== self-study: the model asks Opus for ideas and learns from the answers ===\n");
         printf("(opt-in online mode; the local core otherwise never phones home)\n");
         self_study(rounds);
+        return 0;
+    }
+
+    /* ---- quantization-aware training: make a GOOD 1-bit / int8 model ---- */
+    if (argc >= 3 && strcmp(argv[1], "--quantize-train") == 0) {
+        int qmode = (strcmp(argv[2], "1bit") == 0 || strcmp(argv[2], "1") == 0) ? 1 : 8;
+        const char *data = CORPUS;
+        int dlen = (int)(sizeof(CORPUS) - 1);
+        Corpus c = {0};
+        if (argc >= 4) {                       /* optional corpus path(s) to QAT on */
+            printf("Consolidating QAT corpus from %d path(s):\n", argc - 3);
+            for (int i = 3; i < argc; i++) corpus_append_path(&c, argv[i]);
+            if (c.len < (size_t)(SEQ_LEN + 1)) {
+                fprintf(stderr, "QAT corpus too small — using the embedded corpus.\n");
+            } else { c.buf[c.len] = '\0'; data = c.buf; dlen = (int)c.len; }
+        }
+        printf("=== quantization-aware training (%s) for %d iters ===\n",
+               qmode == 1 ? "1-bit" : "int8", iters);
+        qat_train(data, dlen, iters, qmode);
+        free(c.buf);
+        save_model(CKPT_PATH);                 /* latent float ckpt (quantization-robust) */
+        const char *out = (qmode == 1) ? "sentinel-1bit-qat.bin" : "sentinel-int8-qat.bin";
+        if (save_quant(out, qmode))
+            printf("Saved quantization-robust float checkpoint '%s' + deployable %s model '%s'.\n",
+                   CKPT_PATH, qmode == 1 ? "1-bit" : "int8", out);
+        if (load_quant(out)) {                 /* prove the deployable model generates well */
+            printf("Sample from the %s QAT model (seeded 't'):\n  \"",
+                   qmode == 1 ? "1-bit" : "int8");
+            sample('t', 160);
+            printf("\"\n");
+        }
         return 0;
     }
 

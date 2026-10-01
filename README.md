@@ -86,10 +86,26 @@ make quant                       # writes sentinel-int8.bin and sentinel-1bit.bi
 | `int8` | ~1.0 | ~8x smaller | keeps ~all of it — **recommended** |
 | `1bit` | ~0.13 | ~64x smaller | lossy; use only to squeeze onto tiny hardware |
 
-Honest note: quantization makes the file **smaller**, not the model **smarter**. `int8` is
-the sweet spot. True 1-bit only approaches full quality at billion-parameter scale with
-quantization-aware training; at this size it trades real accuracy for size. The float
-checkpoint (`sentinel.bin`) is never modified by either export.
+Honest note: plain quantization makes the file **smaller**, not the model **smarter**, and
+converting a 1-bit model back to doubles does **not** recover quality — the information is
+already gone. `int8` is the sweet spot. The float checkpoint (`sentinel.bin`) is never
+modified by either export.
+
+### Quantization-aware training (make a *good* low-bit model)
+
+To get a model that's genuinely strong at low precision — not just small — train it *with*
+the quantization in the loop. `--quantize-train` runs the forward/backward pass on
+fake-quantized weights (so the model learns to survive the rounding) while Adam updates the
+full-precision latent weights, using a straight-through estimator:
+
+```bash
+SLM_EPOCHS=20000 ./sentinel --quantize-train 1bit corpus   # train a strong 1-bit model
+SLM_EPOCHS=20000 ./sentinel --quantize-train int8 corpus   # or int8
+```
+
+It writes a quantization-robust float checkpoint plus a deployable quantized model
+(`sentinel-1bit-qat.bin` / `sentinel-int8-qat.bin`) and prints a sample. This is the right
+way to prepare the tiny on-device (ESP32) model, where 1-bit is the only thing that fits.
 
 ## Optional online advisor — Sentinel can ask Opus for ideas (opt-in)
 
