@@ -1,7 +1,12 @@
 # Build artifacts and model checkpoints (regenerated locally)
 sentinel
+sentinel-pet-trainer
+export_model
 *.bin
 sentinel.bin
+
+# Generated on-device model weights (the moat — never publish)
+model.h
 
 # Sub-agent scratch files
 /tmp/slm_agent_snippet*

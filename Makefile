@@ -11,7 +11,7 @@ BIN      = sentinel
 PREFIX  ?= /usr/local
 VERSION ?= 0.5.0
 
-.PHONY: all both slm huge run train quant fetch quick-fetch clean distclean install uninstall package help
+.PHONY: all both slm huge run train quant pet-model fetch quick-fetch clean distclean install uninstall package help
 
 all: $(BIN)            ## build the default ~50M model (plain gcc, runs anywhere)
 
@@ -43,6 +43,18 @@ train: $(BIN)          ## train on ./corpus (run `make fetch` first)
 quant: $(BIN)          ## export small quantized models (int8 ~8x, 1bit ~64x) — float ckpt untouched
 	./$(BIN) --quantize int8 && ./$(BIN) --quantize 1bit
 
+# One command to produce the on-device ESP32 model: train a tiny net
+# (HIDDEN=128/EMBED=32/LAYERS=2) with quantization-AWARE 1-bit training, then
+# emit model.h for the Sentinel Pet firmware. Override SLM_EPOCHS / PET_CORPUS.
+# (tiny + QAT-1bit is the validated on-device config: ~38 KB, stays coherent.)
+pet-model: main.c export_model.c   ## train tiny+QAT-1bit and emit model.h for the ESP32 Pet
+	$(CC) -O2 -Wall -DHIDDEN=128 -DEMBED=32 -DNUM_LAYERS=2 \
+	    -DCKPT_PATH='"sentinel-pet.bin"' -o sentinel-pet-trainer main.c $(LDLIBS)
+	SLM_EPOCHS=$${SLM_EPOCHS:-6000} ./sentinel-pet-trainer --quantize-train 1bit $${PET_CORPUS:-}
+	$(CC) -O2 -Wall -o export_model export_model.c
+	./export_model sentinel-1bit-qat.bin model.h
+	@echo "model.h ready (tiny + QAT 1-bit). Copy it into the private sentinel-pet firmware."
+
 fetch:                 ## download the full real-world corpus (security/coding/CVE)
 	./fetch_corpus.sh
 
@@ -50,7 +62,9 @@ quick-fetch:           ## download a small/fast demo corpus
 	QUICK=1 ./fetch_corpus.sh
 
 clean:                 ## remove the binary and checkpoint
-	rm -f $(BIN) sentinel.bin sentinel-int8.bin sentinel-1bit.bin
+	rm -f $(BIN) sentinel.bin sentinel-int8.bin sentinel-1bit.bin \
+	    sentinel-pet-trainer sentinel-pet.bin sentinel-1bit-qat.bin \
+	    sentinel-int8-qat.bin export_model model.h
 
 distclean: clean       ## also remove the fetched corpus
 	rm -rf corpus
