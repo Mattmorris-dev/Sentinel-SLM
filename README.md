@@ -52,16 +52,85 @@ make && ./start.sh
 
 ## Runs on what you've got — pick a size
 
-| Build | Params | RAM | Flag | Hardware |
+| Build | Params | RAM (train) | Flag | Hardware |
 |---|---|---|---|---|
 | `make slm` | ~1.2M | 27 MB | none | a potato |
 | `make` (default) | ~58M | ~1.9 GB | none (plain gcc) | a Pi 4 / any laptop |
-| `make huge` | ~101M | ~3.2 GB | `-mcmodel=large` | an 8 GB Pi / a server |
+| `make huge` | ~143M | ~4.6 GB | `-mcmodel=large` | **8 GB Pi 5** (the flagship) / a server |
+
+Pick the biggest that fits your RAM — the model is dimension-generic, so one source
+scales from a microcontroller-class SLM to the 8 GB-Pi flagship. Training is CPU-bound
+and slow at the top end (hours), so train on a fast box and ship a quantized export (see
+below) to the Pi for fast, low-RAM inference.
 
 It's a genuine deep network with real weights, gradients, and GRU backprop — built by
 hand in standard C. It learns character/word statistics (not fluent prose); the power is
 the **complete, dependency-free, fully local pipeline**: tokenizer → embedding → stacked
 GRU → BPTT/Adam → checkpointing → retrieval → process-spawning agents.
+
+## Shrink it to ship it — quantization
+
+The trained weights are 8-byte doubles, which is heavy to copy onto a Pi, a USB stick, or
+a microcontroller. Sentinel can export a compact **quantized** copy of the model without
+touching your float checkpoint:
+
+```bash
+make quant                       # writes sentinel-int8.bin and sentinel-1bit.bin
+./sentinel --quantize int8       # int8  — per-row scale,  ~8x smaller than the weights
+./sentinel --quantize 1bit       # 1-bit — sign + per-row magnitude (BinaryConnect style)
+./sentinel --sample-quant sentinel-int8.bin 200   # verify the small model still generates
+```
+
+| Format | Bytes/param | vs. float weights | Quality |
+|---|---|---|---|
+| `int8` | ~1.0 | ~8x smaller | keeps ~all of it — **recommended** |
+| `1bit` | ~0.13 | ~64x smaller | lossy; use only to squeeze onto tiny hardware |
+
+Honest note: plain quantization makes the file **smaller**, not the model **smarter**, and
+converting a 1-bit model back to doubles does **not** recover quality — the information is
+already gone. `int8` is the sweet spot. The float checkpoint (`sentinel.bin`) is never
+modified by either export.
+
+### Quantization-aware training (make a *good* low-bit model)
+
+To get a model that's genuinely strong at low precision — not just small — train it *with*
+the quantization in the loop. `--quantize-train` runs the forward/backward pass on
+fake-quantized weights (so the model learns to survive the rounding) while Adam updates the
+full-precision latent weights, using a straight-through estimator:
+
+```bash
+SLM_EPOCHS=20000 ./sentinel --quantize-train 1bit corpus   # train a strong 1-bit model
+SLM_EPOCHS=20000 ./sentinel --quantize-train int8 corpus   # or int8
+```
+
+It writes a quantization-robust float checkpoint plus a deployable quantized model
+(`sentinel-1bit-qat.bin` / `sentinel-int8-qat.bin`) and prints a sample. This is the right
+way to prepare the tiny on-device (ESP32) model, where 1-bit is the only thing that fits.
+
+## Optional online advisor — Sentinel can ask Opus for ideas (opt-in)
+
+Sentinel is **100% local by default and never phones home.** There is exactly one feature
+that reaches the cloud, and it is **off until you turn it on**: an optional advisor that
+lets the model ask Claude Opus for safe, structural neural-net / security guidance — and,
+if you want, learn from the answers.
+
+```bash
+export ANTHROPIC_API_KEY=...                    # required — unset = fully local, no network
+./sentinel --ask-opus "how should I tune my GRU's learning rate?"
+./sentinel --self-study 5                        # ask Opus 5 questions, LEARN from each answer
+```
+
+- `--ask-opus "<q>"` asks one question and prints the answer.
+- `--self-study [rounds]` is the **self-updating** loop: the model asks Opus a rotating set
+  of architecture questions and trains on each answer, then checkpoints. It updates its own
+  **weights** — never its own code. Opus's output is only ever printed or learned from as
+  text; it is **never executed as a command**.
+
+Safety and privacy by design: the request is built and escaped in C and sent via `curl`
+with the body in a file, so your question never touches a shell; the API key is read from
+the environment by `curl`, never handled by Sentinel. No key set → the advisor does nothing
+and the core stays entirely offline. (`SENTINEL_OPUS_MODEL` overrides the model; default
+`claude-opus-5-5`.)
 
 ## See it run
 

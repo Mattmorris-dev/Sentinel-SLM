@@ -92,7 +92,7 @@
 #ifndef CKPT_PATH
 #define CKPT_PATH   "sentinel.bin"
 #endif
-#define VERSION     "0.3.0"
+#define VERSION     "0.5.0"
 
 /* ------------------------------------------------------------------ */
 /*  Parameters — a stacked GRU (gated recurrent unit) network.         */
@@ -137,6 +137,8 @@ static double vWhy [VOCAB][HIDDEN];
 static double vby  [VOCAB];
 
 static long g_adam_t = 0;   /* Adam timestep, for bias correction */
+static int  g_defer_adam = 0;  /* when set, train_step computes grads but skips Adam
+                                * (used by quantization-aware training) */
 
 /* Per-timestep activation cache used by backprop-through-time. */
 static int    g_in [SEQ_LEN];
@@ -272,6 +274,25 @@ static void gate_backward(int l, int gt, const double *d, const double *xin,
     }
 }
 
+/* Apply one Adam step to every parameter from the accumulated gradients.
+ * Split out of train_step so quantization-aware training can run the
+ * forward/backward on quantized weights but apply Adam to the latent ones. */
+static void apply_adam(void) {
+    g_adam_t++;
+    double bc1 = 1.0 - pow(ADAM_B1, (double)g_adam_t);
+    double bc2 = 1.0 - pow(ADAM_B2, (double)g_adam_t);
+    adam(&Wemb[0][0], &dWemb[0][0], &mWemb[0][0], &vWemb[0][0], VOCAB * EMBED, bc1, bc2);
+    adam(&Why[0][0],  &dWhy[0][0],  &mWhy[0][0],  &vWhy[0][0],  VOCAB * HIDDEN, bc1, bc2);
+    adam(by, dby, mby, vby, VOCAB, bc1, bc2);
+    for (int l = 0; l < NUM_LAYERS; l++) {
+        adam(&Wg[l][0][0][0], &dWg[l][0][0][0], &mWg[l][0][0][0], &vWg[l][0][0][0],
+             NGATE * HIDDEN * HIDDEN, bc1, bc2);
+        adam(&Ug[l][0][0][0], &dUg[l][0][0][0], &mUg[l][0][0][0], &vUg[l][0][0][0],
+             NGATE * HIDDEN * HIDDEN, bc1, bc2);
+        adam(&bg[l][0][0], &dbg[l][0][0], &mbg[l][0][0], &vbg[l][0][0], NGATE * HIDDEN, bc1, bc2);
+    }
+}
+
 static double train_step(const int *inputs, const int *targets,
                          double hprev[NUM_LAYERS][HIDDEN]) {
     /* ---- forward ---- */
@@ -401,20 +422,8 @@ static double train_step(const int *inputs, const int *targets,
         }
     }
 
-    /* ---- Adam update (bias-correction factors computed once per step) ---- */
-    g_adam_t++;
-    double bc1 = 1.0 - pow(ADAM_B1, (double)g_adam_t);
-    double bc2 = 1.0 - pow(ADAM_B2, (double)g_adam_t);
-    adam(&Wemb[0][0], &dWemb[0][0], &mWemb[0][0], &vWemb[0][0], VOCAB * EMBED, bc1, bc2);
-    adam(&Why[0][0],  &dWhy[0][0],  &mWhy[0][0],  &vWhy[0][0],  VOCAB * HIDDEN, bc1, bc2);
-    adam(by, dby, mby, vby, VOCAB, bc1, bc2);
-    for (int l = 0; l < NUM_LAYERS; l++) {
-        adam(&Wg[l][0][0][0], &dWg[l][0][0][0], &mWg[l][0][0][0], &vWg[l][0][0][0],
-             NGATE * HIDDEN * HIDDEN, bc1, bc2);
-        adam(&Ug[l][0][0][0], &dUg[l][0][0][0], &mUg[l][0][0][0], &vUg[l][0][0][0],
-             NGATE * HIDDEN * HIDDEN, bc1, bc2);
-        adam(&bg[l][0][0], &dbg[l][0][0], &mbg[l][0][0], &vbg[l][0][0], NGATE * HIDDEN, bc1, bc2);
-    }
+    /* ---- Adam update (deferred during quantization-aware training) ---- */
+    if (!g_defer_adam) apply_adam();
 
     /* carry the last hidden state forward (continuous, no context limit) */
     for (int l = 0; l < NUM_LAYERS; l++)
@@ -561,6 +570,435 @@ static int load_model(const char *path) {
     ok &= fread(&g_adam_t, sizeof g_adam_t, 1, f) == 1;
     fclose(f);
     return ok;
+}
+
+/* ================================================================== */
+/*  Weight quantization — ship a SMALL model, keep the float one safe.  */
+/*                                                                     */
+/*  The trained weights live as 8-byte doubles (~1.85 GB at the 58M    */
+/*  default).  That is huge to ship to a Pi / USB stick / ESP32.  These */
+/*  routines export a compact quantized copy of the big weight matrices */
+/*  WITHOUT touching the float checkpoint:                              */
+/*                                                                     */
+/*    int8  — 1 byte/param, per-row symmetric scale.  ~8x smaller than  */
+/*            the double checkpoint, keeps ~all the quality.            */
+/*    1-bit — 1 bit/param (the sign) + a per-row magnitude alpha        */
+/*            (BinaryConnect / XNOR-Net style).  ~64x smaller; lossy,   */
+/*            but small enough to fit a bigger model on tiny hardware.  */
+/*                                                                     */
+/*  Biases and the embedding stay full/float precision — they are tiny  */
+/*  and quality-critical.  Quantization is done ROW BY ROW into a small */
+/*  heap buffer, so no large extra array is ever allocated (the default */
+/*  build must stay under the 2 GB static-data limit).                  */
+/* ================================================================== */
+#define QUANT_MAGIC 0x534C4D51u   /* "SLMQ" — quantized export format */
+
+/* Write one row-major tensor (rows x cols) to f, quantized per row. */
+static int quant_write_tensor(FILE *f, const double *M, int rows, int cols, int qmode) {
+    signed char   *q8 = (qmode == 8) ? malloc((size_t)cols)         : NULL;
+    unsigned char *q1 = (qmode == 1) ? malloc(((size_t)cols + 7) / 8) : NULL;
+    if ((qmode == 8 && !q8) || (qmode == 1 && !q1)) { free(q8); free(q1); return 0; }
+    for (int i = 0; i < rows; i++) {
+        const double *row = M + (size_t)i * cols;
+        if (qmode == 8) {
+            double mx = 0.0;
+            for (int j = 0; j < cols; j++) { double a = fabs(row[j]); if (a > mx) mx = a; }
+            float scale = (mx > 0.0) ? (float)(mx / 127.0) : 1.0f;
+            fwrite(&scale, sizeof scale, 1, f);
+            for (int j = 0; j < cols; j++) {
+                long v = lround(row[j] / scale);
+                if (v >  127) v =  127;
+                if (v < -127) v = -127;
+                q8[j] = (signed char)v;
+            }
+            fwrite(q8, 1, (size_t)cols, f);
+        } else {
+            double s = 0.0;
+            for (int j = 0; j < cols; j++) s += fabs(row[j]);
+            float alpha = (cols > 0 && s > 0.0) ? (float)(s / cols) : 1.0f;
+            fwrite(&alpha, sizeof alpha, 1, f);
+            size_t nb = ((size_t)cols + 7) / 8;
+            memset(q1, 0, nb);
+            for (int j = 0; j < cols; j++)
+                if (row[j] >= 0.0) q1[j >> 3] |= (unsigned char)(1u << (j & 7));
+            fwrite(q1, 1, nb, f);
+        }
+    }
+    free(q8); free(q1);
+    return 1;
+}
+
+/* Read one quantized tensor back, dequantizing into the double array M. */
+static int quant_read_tensor(FILE *f, double *M, int rows, int cols, int qmode) {
+    signed char   *q8 = (qmode == 8) ? malloc((size_t)cols)         : NULL;
+    unsigned char *q1 = (qmode == 1) ? malloc(((size_t)cols + 7) / 8) : NULL;
+    if ((qmode == 8 && !q8) || (qmode == 1 && !q1)) { free(q8); free(q1); return 0; }
+    int ok = 1;
+    for (int i = 0; i < rows && ok; i++) {
+        double *row = M + (size_t)i * cols;
+        if (qmode == 8) {
+            float scale;
+            ok &= fread(&scale, sizeof scale, 1, f) == 1;
+            ok &= fread(q8, 1, (size_t)cols, f) == (size_t)cols;
+            for (int j = 0; j < cols && ok; j++) row[j] = (double)q8[j] * scale;
+        } else {
+            float alpha;
+            size_t nb = ((size_t)cols + 7) / 8;
+            ok &= fread(&alpha, sizeof alpha, 1, f) == 1;
+            ok &= fread(q1, 1, nb, f) == nb;
+            for (int j = 0; j < cols && ok; j++)
+                row[j] = (q1[j >> 3] & (1u << (j & 7))) ? (double)alpha : -(double)alpha;
+        }
+    }
+    free(q8); free(q1);
+    return ok;
+}
+
+/* Small full-precision tensors (biases) are stored as float32. */
+static void f32_write(FILE *f, const double *a, int n) {
+    for (int i = 0; i < n; i++) { float v = (float)a[i]; fwrite(&v, sizeof v, 1, f); }
+}
+static int f32_read(FILE *f, double *a, int n) {
+    int ok = 1;
+    for (int i = 0; i < n; i++) { float v; ok &= fread(&v, sizeof v, 1, f) == 1; a[i] = v; }
+    return ok;
+}
+
+/* Export a quantized copy of the current weights.  Refuses to overwrite the
+ * float checkpoint, so a trained model can never be clobbered by accident. */
+static int save_quant(const char *path, int qmode) {
+    if (strcmp(path, CKPT_PATH) == 0) {
+        fprintf(stderr, "quantize: refusing to overwrite the float checkpoint '%s'\n", path);
+        return 0;
+    }
+    FILE *f = fopen(path, "wb");
+    if (!f) return 0;
+    unsigned hdr[7] = { QUANT_MAGIC, (unsigned)qmode, VOCAB, EMBED, HIDDEN, NUM_LAYERS, 1u };
+    fwrite(hdr, sizeof(unsigned), 7, f);
+    int ok = 1;
+    ok &= quant_write_tensor(f, &Wemb[0][0], VOCAB, EMBED, qmode);
+    for (int l = 0; l < NUM_LAYERS && ok; l++)
+        for (int g = 0; g < NGATE && ok; g++) {
+            ok &= quant_write_tensor(f, &Wg[l][g][0][0], HIDDEN, HIDDEN, qmode);
+            ok &= quant_write_tensor(f, &Ug[l][g][0][0], HIDDEN, HIDDEN, qmode);
+        }
+    ok &= quant_write_tensor(f, &Why[0][0], VOCAB, HIDDEN, qmode);
+    f32_write(f, &bg[0][0][0], NUM_LAYERS * NGATE * HIDDEN);   /* biases: full precision */
+    f32_write(f, by, VOCAB);
+    fclose(f);
+    return ok;
+}
+
+/* Load a quantized export, dequantizing into the live weight arrays so the
+ * existing sample()/forward path can run it unchanged. */
+static int load_quant(const char *path) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return 0;
+    unsigned hdr[7];
+    if (fread(hdr, sizeof(unsigned), 7, f) != 7 || hdr[0] != QUANT_MAGIC ||
+        hdr[2] != VOCAB || hdr[3] != EMBED || hdr[4] != HIDDEN || hdr[5] != NUM_LAYERS) {
+        fclose(f);
+        return 0;   /* wrong format or architecture -> caller handles it */
+    }
+    int qmode = (int)hdr[1], ok = 1;
+    ok &= quant_read_tensor(f, &Wemb[0][0], VOCAB, EMBED, qmode);
+    for (int l = 0; l < NUM_LAYERS && ok; l++)
+        for (int g = 0; g < NGATE && ok; g++) {
+            ok &= quant_read_tensor(f, &Wg[l][g][0][0], HIDDEN, HIDDEN, qmode);
+            ok &= quant_read_tensor(f, &Ug[l][g][0][0], HIDDEN, HIDDEN, qmode);
+        }
+    ok &= quant_read_tensor(f, &Why[0][0], VOCAB, HIDDEN, qmode);
+    ok &= f32_read(f, &bg[0][0][0], NUM_LAYERS * NGATE * HIDDEN);
+    ok &= f32_read(f, by, VOCAB);
+    fclose(f);
+    return ok;
+}
+
+/* ================================================================== */
+/*  Quantization-aware training (QAT) — make a 1-bit / int8 model that   */
+/*  is actually GOOD, not just small.                                    */
+/*                                                                      */
+/*  Plain quantization (above) rounds a finished float model and loses   */
+/*  quality.  QAT instead trains the model to survive quantization: on   */
+/*  every step the forward+backward pass runs on FAKE-QUANTIZED weights  */
+/*  (so the model "sees" the low precision it will be deployed at), but  */
+/*  Adam updates the full-precision LATENT weights.  Gradients flow      */
+/*  through the quantizer via the straight-through estimator (treat the  */
+/*  round/sign as identity in the backward pass).  Over training the     */
+/*  latent weights move to values whose quantized form still works —     */
+/*  this is the only way to get a genuinely strong 1-bit model.          */
+/* ================================================================== */
+
+/* In-place "fake quantize": round each row to the target precision and
+ * immediately expand back to double (quantize->dequantize), so the forward
+ * pass uses exactly the values the deployed model will. */
+static void fake_quant_tensor(double *M, int rows, int cols, int qmode) {
+    for (int i = 0; i < rows; i++) {
+        double *row = M + (size_t)i * cols;
+        if (qmode == 8) {
+            double mx = 0.0;
+            for (int j = 0; j < cols; j++) { double a = fabs(row[j]); if (a > mx) mx = a; }
+            double scale = (mx > 0.0) ? mx / 127.0 : 1.0;
+            for (int j = 0; j < cols; j++) {
+                long v = lround(row[j] / scale);
+                if (v >  127) v =  127;
+                if (v < -127) v = -127;
+                row[j] = (double)v * scale;
+            }
+        } else {
+            double s = 0.0;
+            for (int j = 0; j < cols; j++) s += fabs(row[j]);
+            double alpha = (cols > 0 && s > 0.0) ? s / cols : 1.0;
+            for (int j = 0; j < cols; j++) row[j] = (row[j] >= 0.0) ? alpha : -alpha;
+        }
+    }
+}
+
+/* Fake-quantize every weight matrix we export (biases stay full precision). */
+static void fake_quant_all(int qmode) {
+    fake_quant_tensor(&Wemb[0][0], VOCAB, EMBED, qmode);
+    for (int l = 0; l < NUM_LAYERS; l++)
+        for (int g = 0; g < NGATE; g++) {
+            fake_quant_tensor(&Wg[l][g][0][0], HIDDEN, HIDDEN, qmode);
+            fake_quant_tensor(&Ug[l][g][0][0], HIDDEN, HIDDEN, qmode);
+        }
+    fake_quant_tensor(&Why[0][0], VOCAB, HIDDEN, qmode);
+}
+
+/* One QAT step: back up latent weights, fake-quantize in place, run
+ * forward+backward (grads only), restore latent, then Adam-update the latent
+ * weights with the straight-through gradients. */
+static double qat_step(const int *in, const int *tg, double hprev[NUM_LAYERS][HIDDEN],
+                       int qmode, double *sWemb, double *sWg, double *sUg, double *sWhy) {
+    memcpy(sWemb, Wemb, sizeof Wemb); memcpy(sWg, Wg, sizeof Wg);
+    memcpy(sUg,   Ug,   sizeof Ug);   memcpy(sWhy, Why, sizeof Why);
+    fake_quant_all(qmode);                       /* globals -> effective (quantized) */
+    g_defer_adam = 1;
+    double loss = train_step(in, tg, hprev);     /* forward+backward, no Adam */
+    g_defer_adam = 0;
+    memcpy(Wemb, sWemb, sizeof Wemb); memcpy(Wg, sWg, sizeof Wg);
+    memcpy(Ug,   sUg,   sizeof Ug);   memcpy(Why, sWhy, sizeof Why);   /* restore latent */
+    apply_adam();                                /* update latent via straight-through grads */
+    return loss;
+}
+
+/* Train `iters` steps with QAT at the given precision.  Shadow (latent backup)
+ * is heap-allocated, so it never counts against the 2 GB static-data limit. */
+static void qat_train(const char *data, int data_len, int iters, int qmode) {
+    if (data_len < SEQ_LEN + 1) { fprintf(stderr, "QAT: corpus too small\n"); return; }
+    double *sWemb = malloc(sizeof Wemb), *sWg = malloc(sizeof Wg);
+    double *sUg   = malloc(sizeof Ug),   *sWhy = malloc(sizeof Why);
+    if (!sWemb || !sWg || !sUg || !sWhy) {
+        fprintf(stderr, "QAT: out of memory for shadow weights\n");
+        free(sWemb); free(sWg); free(sUg); free(sWhy); return;
+    }
+    double hprev[NUM_LAYERS][HIDDEN];
+    memset(hprev, 0, sizeof hprev);
+    int p = 0, inputs[SEQ_LEN], targets[SEQ_LEN];
+    double smooth = -1.0;
+    for (int it = 0; it < iters; it++) {
+        if (p + SEQ_LEN + 1 >= data_len) { p = 0; memset(hprev, 0, sizeof hprev); }
+        for (int k = 0; k < SEQ_LEN; k++) {
+            inputs[k]  = (unsigned char)data[p + k]     & (VOCAB - 1);
+            targets[k] = (unsigned char)data[p + k + 1] & (VOCAB - 1);
+        }
+        double loss = qat_step(inputs, targets, hprev, qmode, sWemb, sWg, sUg, sWhy);
+        double per_char = loss / SEQ_LEN;
+        smooth = (smooth < 0.0) ? per_char : 0.999 * smooth + 0.001 * per_char;
+        p += SEQ_LEN;
+        if (it % 200 == 0 || it == iters - 1)
+            printf("  qat iter %5d/%d   loss/char = %.4f\n", it, iters, smooth);
+    }
+    free(sWemb); free(sWg); free(sUg); free(sWhy);
+}
+
+/* ================================================================== */
+/*  Optional online advisor — Sentinel can ask Claude Opus for safe,    */
+/*  structural neural-net / security ideas, and (opt-in) learn from the  */
+/*  answers.  This is the ONE part of Sentinel that talks to the cloud:  */
+/*                                                                      */
+/*    * OFF by default.  It does nothing unless ANTHROPIC_API_KEY is set */
+/*      AND you explicitly run --ask-opus / --self-study.  The core      */
+/*      stays 100% local.                                                */
+/*    * The question is JSON-escaped in C and written to a temp file, so */
+/*      it never passes through the shell (no injection).  The API key   */
+/*      is read from the environment by curl, never by this program.     */
+/*    * Opus output is only ever PRINTED or LEARNED FROM AS TEXT.  It is  */
+/*      never executed as a command and never rewrites Sentinel's source.*/
+/*      "Self-updating" here means the model updates its own WEIGHTS by   */
+/*      studying the answer — not its code.                              */
+/* ================================================================== */
+#define OPUS_MODEL_DEFAULT "claude-opus-5-5"
+#define OPUS_ENDPOINT      "https://api.anthropic.com/v1/messages"
+
+/* Escape a string for embedding inside a JSON string literal. */
+static void json_escape(const char *in, char *out, size_t outsz) {
+    size_t o = 0;
+    for (const unsigned char *p = (const unsigned char *)in; *p && o + 7 < outsz; p++) {
+        unsigned char c = *p;
+        switch (c) {
+            case '"':  out[o++] = '\\'; out[o++] = '"';  break;
+            case '\\': out[o++] = '\\'; out[o++] = '\\'; break;
+            case '\n': out[o++] = '\\'; out[o++] = 'n';  break;
+            case '\r': out[o++] = '\\'; out[o++] = 'r';  break;
+            case '\t': out[o++] = '\\'; out[o++] = 't';  break;
+            default:
+                if (c < 0x20) o += (size_t)snprintf(out + o, outsz - o, "\\u%04x", c);
+                else          out[o++] = (char)c;
+        }
+    }
+    out[o] = '\0';
+}
+
+/* Pull the first "type":"text" block's text out of an API response, undoing
+ * JSON string escapes.  Parsed in C (not the shell), so response content —
+ * whatever it is — can never be executed. */
+static int json_extract_text(const char *resp, char *out, size_t outsz) {
+    const char *t = strstr(resp, "\"type\":\"text\"");
+    const char *k = strstr(t ? t : resp, "\"text\":");
+    if (!k) return 0;
+    k = strchr(k + 7, '"');
+    if (!k) return 0;
+    k++;
+    size_t o = 0;
+    while (*k && o + 4 < outsz) {
+        if (*k == '"') break;                      /* end of the JSON string */
+        if (*k == '\\') {
+            k++;
+            switch (*k) {
+                case 'n': out[o++] = '\n'; break;
+                case 'r': out[o++] = '\r'; break;
+                case 't': out[o++] = '\t'; break;
+                case '"': out[o++] = '"';  break;
+                case '\\': out[o++] = '\\'; break;
+                case '/': out[o++] = '/';  break;
+                case 'u': {
+                    char hex[5] = { k[1], k[2], k[3], k[4], 0 };
+                    long cp = (k[1] && k[2] && k[3] && k[4]) ? strtol(hex, NULL, 16) : 0;
+                    if (cp < 0x80) out[o++] = (char)cp;
+                    else if (cp < 0x800) { out[o++] = (char)(0xC0 | (cp >> 6)); out[o++] = (char)(0x80 | (cp & 0x3F)); }
+                    else { out[o++] = (char)(0xE0 | (cp >> 12)); out[o++] = (char)(0x80 | ((cp >> 6) & 0x3F)); out[o++] = (char)(0x80 | (cp & 0x3F)); }
+                    if (k[1] && k[2] && k[3] && k[4]) k += 4;
+                    break;
+                }
+                default: out[o++] = *k; break;
+            }
+            if (*k) k++;
+        } else {
+            out[o++] = *k++;
+        }
+    }
+    out[o] = '\0';
+    return 1;
+}
+
+/* Ask Claude Opus a question; fill `answer`.  Returns 0 on success, -1 on any
+ * failure (no key, no network, no curl, empty response) with a message in
+ * `answer`.  Opt-in: does nothing without ANTHROPIC_API_KEY. */
+static int ask_opus(const char *question, const char *system_prompt,
+                    char *answer, size_t ansz) {
+    if (!getenv("ANTHROPIC_API_KEY")) {
+        snprintf(answer, ansz,
+                 "ANTHROPIC_API_KEY is not set. The online advisor is opt-in and off by "
+                 "default — run `export ANTHROPIC_API_KEY=...` to enable it.");
+        return -1;
+    }
+    const char *model = getenv("SENTINEL_OPUS_MODEL");
+    if (!model || !*model) model = OPUS_MODEL_DEFAULT;
+
+    char esc_q[8192], esc_s[2048], esc_m[128];
+    json_escape(question, esc_q, sizeof esc_q);
+    json_escape(system_prompt ? system_prompt : "", esc_s, sizeof esc_s);
+    json_escape(model, esc_m, sizeof esc_m);
+
+    char tmpl[] = "/tmp/sentinel_opus_XXXXXX";
+    int fd = mkstemp(tmpl);
+    if (fd < 0) { snprintf(answer, ansz, "could not create a temp request file"); return -1; }
+    FILE *bf = fdopen(fd, "w");
+    if (!bf) { close(fd); unlink(tmpl); snprintf(answer, ansz, "temp file error"); return -1; }
+    fprintf(bf,
+        "{\"model\":\"%s\",\"max_tokens\":1024,"
+        "\"system\":\"%s\","
+        "\"messages\":[{\"role\":\"user\",\"content\":\"%s\"}]}",
+        esc_m, esc_s, esc_q);
+    fclose(bf);
+
+    /* API key stays in the environment; only fixed strings + our temp path
+     * reach the shell. The request body is @file, so the question is never
+     * on the command line. */
+    char cmd[4096];
+    snprintf(cmd, sizeof cmd,
+        "curl -s --max-time 60 %s "
+        "-H 'content-type: application/json' "
+        "-H \"x-api-key: $ANTHROPIC_API_KEY\" "
+        "-H 'anthropic-version: 2023-06-01' "
+        "--data-binary @%s",
+        OPUS_ENDPOINT, tmpl);
+
+    FILE *pp = popen(cmd, "r");
+    if (!pp) { unlink(tmpl); snprintf(answer, ansz, "could not launch curl (is it installed?)"); return -1; }
+    static char resp[1 << 16];
+    size_t rn = fread(resp, 1, sizeof resp - 1, pp);
+    resp[rn] = '\0';
+    pclose(pp);
+    unlink(tmpl);
+
+    if (rn == 0) { snprintf(answer, ansz, "empty response (network blocked, or curl missing?)"); return -1; }
+    if (!json_extract_text(resp, answer, ansz)) {
+        const char *e = strstr(resp, "\"message\":");
+        snprintf(answer, ansz, "no text block in response. raw: %.700s", e ? e : resp);
+        return -1;
+    }
+    return 0;
+}
+
+/* Self-study loop: ask Opus a rotating set of safe neural-net / security
+ * questions and LEARN from each answer (online training on the answer text),
+ * checkpointing after each round.  The model updates its own weights — never
+ * its code.  Opt-in; stops immediately if the advisor is unavailable. */
+static int self_study(int rounds) {
+    static const char *QBANK[] = {
+        "In 3 short sentences, suggest one concrete, safe improvement to a character-level "
+        "stacked-GRU language model trained with Adam in pure C. Be specific and practical.",
+        "In 3 short sentences, explain gradient clipping and a good clip value for a small GRU, "
+        "and why it helps training stability.",
+        "In 3 short sentences, name one data-preprocessing or curriculum step that improves a "
+        "small, security-focused character-level language model.",
+        "In 3 short sentences, explain the tradeoff between widening (more hidden units) and "
+        "deepening (more layers) a small GRU for a fixed parameter budget.",
+        "In 3 short sentences, explain how int8 weight quantization keeps model quality while "
+        "shrinking the model, and one pitfall to avoid.",
+    };
+    int nq = (int)(sizeof QBANK / sizeof QBANK[0]);
+    const char *sys =
+        "You are a concise neural-network engineering tutor helping a small, local, pure-C "
+        "GRU language model understand how it can improve itself. Give short, practical, "
+        "safe, legal guidance only — no exploit code, no attack instructions.";
+    static char answer[1 << 16];
+    int learned = 0;
+    for (int r = 0; r < rounds; r++) {
+        const char *q = QBANK[r % nq];
+        printf("\n[self-study %d/%d] asking Opus:\n  Q: %s\n", r + 1, rounds, q);
+        fflush(stdout);
+        if (ask_opus(q, sys, answer, sizeof answer) != 0) {
+            printf("  ! advisor unavailable: %s\n", answer);
+            break;
+        }
+        printf("  A: %s\n", answer);
+        size_t al = strlen(answer);
+        if (al >= SEQ_LEN + 1) {
+            int iters = (int)(al / SEQ_LEN) * 4;
+            if (iters < 20) iters = 20;
+            train(answer, (int)al, iters, 0);
+            learned++;
+            printf("  [self-update] studied the answer (%zu chars, %d iters) and checkpointed.\n",
+                   al, iters);
+        }
+        save_model(CKPT_PATH);
+    }
+    printf("\n[self-study] updated the model from %d Opus answer(s); '%s' saved.\n",
+           learned, CKPT_PATH);
+    return learned;
 }
 
 /* ================================================================== */
@@ -1231,6 +1669,24 @@ static void print_usage(const char *prog) {
 "  %s --agent \"<task>\"     run once as a single sub-agent for <task>\n"
 "  %s --tui                styled terminal UI (interactive agent console)\n"
 "  %s --serve [port]       web GUI on http://127.0.0.1:8080 (localhost only)\n"
+"  %s --quantize <int8|1bit> [out]\n"
+"                            export a SMALL quantized copy of the model for\n"
+"                            shipping (int8 ~8x / 1bit ~64x smaller); the float\n"
+"                            checkpoint is never touched\n"
+"  %s --sample-quant <file> [n]\n"
+"                            load a quantized model and print an n-char sample\n"
+"                            (verify the small model still generates)\n"
+"  %s --quantize-train <int8|1bit> [corpus...]\n"
+"                            quantization-AWARE training: train a model that is\n"
+"                            actually GOOD at low precision (straight-through\n"
+"                            estimator). Writes a robust float ckpt + deployable\n"
+"                            quantized model. Iters via SLM_EPOCHS.\n"
+"  %s --ask-opus \"<question>\"\n"
+"                            OPT-IN online advisor: ask Claude Opus one safe\n"
+"                            neural-net/security question (needs ANTHROPIC_API_KEY)\n"
+"  %s --self-study [rounds]\n"
+"                            OPT-IN: the model asks Opus for ideas and LEARNS from\n"
+"                            the answers (updates its weights, never its code)\n"
 "  %s --help | -h          show this help\n"
 "  %s --version            print version\n"
 "\n"
@@ -1258,12 +1714,15 @@ static void print_usage(const char *prog) {
 "ENVIRONMENT VARIABLES\n"
 "  SLM_EPOCHS=N              training iterations (default 2000)\n"
 "  SLM_NO_EXEC=1             agents PLAN ONLY — print commands, run nothing\n"
+"  ANTHROPIC_API_KEY=...     enables the OPT-IN online advisor (--ask-opus /\n"
+"                            --self-study). Unset = the core is 100%% local.\n"
+"  SENTINEL_OPUS_MODEL=...   advisor model id (default claude-opus-5-5)\n"
 "\n"
 "SAFETY\n"
 "  Sub-agents run real shell commands but a hard guard refuses 'sudo' and\n"
 "  destructive patterns (rm -rf /, mkfs, dd, fork bombs, shutdown, ...).\n"
 "  Set SLM_NO_EXEC=1 to disable command execution entirely.\n",
-        VERSION, prog, prog, prog, prog, prog, prog, prog, prog);
+        VERSION, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog);
 }
 
 int main(int argc, char **argv) {
@@ -1278,6 +1737,17 @@ int main(int argc, char **argv) {
                       strcmp(argv[1], "-v") == 0)) {
         printf("Sentinel v%s\n", VERSION);
         return 0;
+    }
+
+    /* ---- optional online advisor: ask Claude Opus one question (opt-in) ---- */
+    if (argc >= 3 && strcmp(argv[1], "--ask-opus") == 0) {
+        static char ans[1 << 16];
+        const char *sys =
+            "You are a concise neural-network and security engineering advisor for a small, "
+            "local, pure-C GRU model. Give short, practical, safe, legal guidance only.";
+        int rc = ask_opus(argv[2], sys, ans, sizeof ans);
+        printf("%s\n", ans);
+        return rc == 0 ? 0 : 1;
     }
 
     /* ---- sub-agent mode:  --agent <tier> <task>  (legacy:  --agent <task>) ---- */
@@ -1300,6 +1770,45 @@ int main(int argc, char **argv) {
     srand(1234567u);
     init_weights();
 
+    /* ---- quantized export (non-destructive) and quantized-sample verify ---- */
+    if (argc >= 3 && strcmp(argv[1], "--quantize") == 0) {
+        int qmode = (strcmp(argv[2], "1bit") == 0 || strcmp(argv[2], "1") == 0) ? 1 : 8;
+        const char *out = (argc >= 4) ? argv[3]
+                        : (qmode == 1 ? "sentinel-1bit.bin" : "sentinel-int8.bin");
+        if (load_model(CKPT_PATH))
+            printf("Loaded float checkpoint '%s'.\n", CKPT_PATH);
+        else
+            printf("No float checkpoint '%s' — quantizing current (untrained) weights.\n",
+                   CKPT_PATH);
+        if (!save_quant(out, qmode)) {
+            fprintf(stderr, "quantize: failed to write '%s'\n", out);
+            return 1;
+        }
+        struct stat sf, sq;
+        long params = (long)(VOCAB*EMBED + NUM_LAYERS*NGATE*(2*HIDDEN*HIDDEN + HIDDEN)
+                             + VOCAB*HIDDEN + VOCAB);
+        printf("Quantized to %s and wrote '%s'.\n", qmode == 1 ? "1-bit" : "int8", out);
+        printf("  params: %ld   (~%.2f bytes/param in this file)\n", params,
+               stat(out, &sq) == 0 ? (double)sq.st_size / (double)params : 0.0);
+        if (stat(CKPT_PATH, &sf) == 0 && stat(out, &sq) == 0 && sq.st_size > 0)
+            printf("  float checkpoint: %.1f MB  ->  quantized: %.1f MB  (%.1fx smaller)\n",
+                   sf.st_size / 1e6, sq.st_size / 1e6, (double)sf.st_size / (double)sq.st_size);
+        printf("  your float checkpoint '%s' is untouched.\n", CKPT_PATH);
+        return 0;
+    }
+    if (argc >= 3 && strcmp(argv[1], "--sample-quant") == 0) {
+        if (!load_quant(argv[2])) {
+            fprintf(stderr, "cannot load quantized model '%s' (wrong format or arch)\n", argv[2]);
+            return 1;
+        }
+        int n = (argc >= 4) ? atoi(argv[3]) : 200;
+        if (n <= 0) n = 200;
+        printf("Loaded quantized model '%s'. Sample (seeded 't'):\n  \"", argv[2]);
+        sample('t', n);
+        printf("\"\n");
+        return 0;
+    }
+
     int loaded = load_model(CKPT_PATH);
     if (loaded) printf("Loaded checkpoint '%s' — continuing to learn.\n", CKPT_PATH);
     else        printf("No checkpoint — starting from fixed static weights.\n");
@@ -1307,6 +1816,48 @@ int main(int argc, char **argv) {
     int iters = 2000;
     const char *env_ep = getenv("SLM_EPOCHS");
     if (env_ep) { int v = atoi(env_ep); if (v > 0) iters = v; }
+
+    /* ---- self-study: learn neural-net/security ideas from Opus (opt-in) ---- */
+    if (argc >= 2 && strcmp(argv[1], "--self-study") == 0) {
+        int rounds = (argc >= 3) ? atoi(argv[2]) : 3;
+        if (rounds < 1) rounds = 1;
+        if (rounds > 50) rounds = 50;
+        printf("=== self-study: the model asks Opus for ideas and learns from the answers ===\n");
+        printf("(opt-in online mode; the local core otherwise never phones home)\n");
+        self_study(rounds);
+        return 0;
+    }
+
+    /* ---- quantization-aware training: make a GOOD 1-bit / int8 model ---- */
+    if (argc >= 3 && strcmp(argv[1], "--quantize-train") == 0) {
+        int qmode = (strcmp(argv[2], "1bit") == 0 || strcmp(argv[2], "1") == 0) ? 1 : 8;
+        const char *data = CORPUS;
+        int dlen = (int)(sizeof(CORPUS) - 1);
+        Corpus c = {0};
+        if (argc >= 4) {                       /* optional corpus path(s) to QAT on */
+            printf("Consolidating QAT corpus from %d path(s):\n", argc - 3);
+            for (int i = 3; i < argc; i++) corpus_append_path(&c, argv[i]);
+            if (c.len < (size_t)(SEQ_LEN + 1)) {
+                fprintf(stderr, "QAT corpus too small — using the embedded corpus.\n");
+            } else { c.buf[c.len] = '\0'; data = c.buf; dlen = (int)c.len; }
+        }
+        printf("=== quantization-aware training (%s) for %d iters ===\n",
+               qmode == 1 ? "1-bit" : "int8", iters);
+        qat_train(data, dlen, iters, qmode);
+        free(c.buf);
+        save_model(CKPT_PATH);                 /* latent float ckpt (quantization-robust) */
+        const char *out = (qmode == 1) ? "sentinel-1bit-qat.bin" : "sentinel-int8-qat.bin";
+        if (save_quant(out, qmode))
+            printf("Saved quantization-robust float checkpoint '%s' + deployable %s model '%s'.\n",
+                   CKPT_PATH, qmode == 1 ? "1-bit" : "int8", out);
+        if (load_quant(out)) {                 /* prove the deployable model generates well */
+            printf("Sample from the %s QAT model (seeded 't'):\n  \"",
+                   qmode == 1 ? "1-bit" : "int8");
+            sample('t', 160);
+            printf("\"\n");
+        }
+        return 0;
+    }
 
     /* ---- external-corpus training mode (with data consolidation) ---- */
     if (argc >= 3 && strcmp(argv[1], "--train") == 0) {

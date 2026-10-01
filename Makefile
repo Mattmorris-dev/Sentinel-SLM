@@ -9,9 +9,9 @@ CFLAGS  ?= -O2 -Wall
 LDLIBS   = -lm
 BIN      = sentinel
 PREFIX  ?= /usr/local
-VERSION ?= 0.3.0
+VERSION ?= 0.5.0
 
-.PHONY: all both slm huge run train fetch quick-fetch clean distclean install uninstall package help
+.PHONY: all both slm huge run train quant fetch quick-fetch clean distclean install uninstall package help
 
 all: $(BIN)            ## build the default ~50M model (plain gcc, runs anywhere)
 
@@ -23,9 +23,13 @@ slm: main.c            ## build a tiny SLM (sentinel-slm, ~1.2M params)
 	$(CC) -O2 -Wall -DHIDDEN=256 -DEMBED=64 -DNUM_LAYERS=2 \
 	    -DCKPT_PATH='"sentinel-slm.bin"' -o sentinel-slm main.c $(LDLIBS)
 
-# The big model (~101M params, ~3.2 GB) — needs the large code model.
-huge: main.c           ## build the 101M model (sentinel-huge, needs 8 GB RAM)
-	$(CC) -O2 -Wall -mcmodel=large -DHIDDEN=2368 \
+# The flagship model, sized to MAX OUT an 8 GB Raspberry Pi 5 (the biggest Pi):
+# ~142M params, ~4.6 GB to train (Adam ~32 B/param), leaving headroom for the OS.
+# Needs the large code model (>2 GB static arrays). Train on a fast box if you
+# can — a real train at this width takes many CPU-hours — then ship an int8
+# export (`make quant`) to the Pi for fast, low-RAM inference.
+huge: main.c           ## build the 8 GB Pi 5 flagship (sentinel-huge, ~142M params)
+	$(CC) -O2 -Wall -mcmodel=large -DHIDDEN=2816 \
 	    -DCKPT_PATH='"sentinel-huge.bin"' -o sentinel-huge main.c $(LDLIBS)
 
 both: $(BIN) slm       ## build the default model + the tiny SLM
@@ -36,6 +40,9 @@ run: $(BIN)            ## train on the built-in corpus, then serve the read/agen
 train: $(BIN)          ## train on ./corpus (run `make fetch` first)
 	./$(BIN) --train corpus
 
+quant: $(BIN)          ## export small quantized models (int8 ~8x, 1bit ~64x) — float ckpt untouched
+	./$(BIN) --quantize int8 && ./$(BIN) --quantize 1bit
+
 fetch:                 ## download the full real-world corpus (security/coding/CVE)
 	./fetch_corpus.sh
 
@@ -43,7 +50,7 @@ quick-fetch:           ## download a small/fast demo corpus
 	QUICK=1 ./fetch_corpus.sh
 
 clean:                 ## remove the binary and checkpoint
-	rm -f $(BIN) sentinel.bin
+	rm -f $(BIN) sentinel.bin sentinel-int8.bin sentinel-1bit.bin
 
 distclean: clean       ## also remove the fetched corpus
 	rm -rf corpus
