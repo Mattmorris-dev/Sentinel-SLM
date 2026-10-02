@@ -9,7 +9,7 @@ It runs on a $50 Raspberry Pi, answers CVE / malware / OSINT questions from real
 and spawns its own sub-agents to do the work — entirely on your machine.
 
 ```sh
-git clone https://github.com/mattmorris-dev/Sentinel && cd Sentinel
+git clone https://github.com/Mattmorris-dev/Sentinel-SLM && cd Sentinel-SLM
 make && ./start.sh
 ```
 

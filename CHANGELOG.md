@@ -5,6 +5,43 @@ GitHub Release. Format loosely follows [Keep a Changelog](https://keepachangelog
 
 ---
 
+## v0.6.0
+
+**LayerNorm, weight tying, and a gradient checker.**
+
+- `-DUSE_LN` / `make ln`: optional Layer-Normalized GRU (learnable gain per gate
+  channel). Converges faster — e.g. 3.28 vs 3.75 loss/char at the same budget.
+  LN checkpoints use a new format tag (`SLM4`) so they can't be cross-loaded.
+- `-DTIE_WEIGHTS`: optional weight tying (output projection = input embedding);
+  requires `EMBED == HIDDEN`. No checkpoint-format change.
+- `--gradcheck` / `make gradcheck`: verifies every analytic gradient against finite
+  differences. Default, LayerNorm, and tied builds all pass.
+- All options are off by default; the standard build is unchanged.
+
+## v0.5.1
+
+**Safer long training runs.**
+
+- Linear learning-rate warmup (first 200 steps of a fresh model, then constant, so
+  online learning keeps working across runs).
+- Auto-checkpoint every 2000 iterations of a long `--train` / `--quantize-train` run
+  (`-DCKPT_EVERY=N` to change), so an interrupted run resumes.
+- `SLM_LR` environment variable overrides the learning rate at runtime.
+
+## v0.5.0
+
+**Quantization, on-device models, and an opt-in advisor.**
+
+- `--quantize int8|1bit` exports a compact copy of the model (int8 ~8x smaller than the
+  weights) without touching the float checkpoint; `--sample-quant` checks it.
+- `--quantize-train int8|1bit`: quantization-aware training (straight-through
+  estimator) — makes 1-bit models coherent instead of gibberish.
+- `make pet-model` + `export_model.c`: one command trains the tiny on-device model with
+  1-bit QAT and emits `model.h` for microcontroller firmware.
+- `--ask-opus` / `--self-study`: opt-in online advisor (needs `ANTHROPIC_API_KEY`;
+  fully local otherwise). Answers are printed or trained on, never executed.
+- `make huge` resized to max out an 8 GB Raspberry Pi 5 (~143M params).
+
 ## v0.3.1
 
 **Open-core positioning, landing page, and polish.**
