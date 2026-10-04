@@ -5,7 +5,12 @@ CC      ?= gcc
 # The default ~50M-param model uses <2 GB of static arrays, so it builds with
 # plain gcc and runs anywhere. (The 'huge' target adds -mcmodel=large for the
 # 101M model, whose arrays exceed the 2 GB small-code-model limit.)
-CFLAGS  ?= -O2 -Wall
+# LayerNorm (-DUSE_LN) is ON by default: it's gradient-checked and converges to a
+# lower loss at the same budget, so the standard build is the stronger model.
+# Override with `make USE_LN=0` for the plain GRU.
+USE_LN  ?= 1
+LNFLAG   = $(if $(filter 0,$(USE_LN)),,-DUSE_LN)
+CFLAGS  ?= -O2 -Wall $(LNFLAG)
 LDLIBS   = -lm
 BIN      = sentinel
 PREFIX  ?= /usr/local
@@ -20,7 +25,7 @@ $(BIN): main.c
 
 # A tiny SLM from the SAME source (~1.2M params, 27 MB). Runs on anything.
 slm: main.c            ## build a tiny SLM (sentinel-slm, ~1.2M params)
-	$(CC) -O2 -Wall -DHIDDEN=256 -DEMBED=64 -DNUM_LAYERS=2 \
+	$(CC) -O2 -Wall $(LNFLAG) -DHIDDEN=256 -DEMBED=64 -DNUM_LAYERS=2 \
 	    -DCKPT_PATH='"sentinel-slm.bin"' -o sentinel-slm main.c $(LDLIBS)
 
 # The flagship model, sized to MAX OUT an 8 GB Raspberry Pi 5 (the biggest Pi):
@@ -29,7 +34,7 @@ slm: main.c            ## build a tiny SLM (sentinel-slm, ~1.2M params)
 # can — a real train at this width takes many CPU-hours — then ship an int8
 # export (`make quant`) to the Pi for fast, low-RAM inference.
 huge: main.c           ## build the 8 GB Pi 5 flagship (sentinel-huge, ~142M params)
-	$(CC) -O2 -Wall -mcmodel=large -DHIDDEN=2816 \
+	$(CC) -O2 -Wall $(LNFLAG) -mcmodel=large -DHIDDEN=2816 \
 	    -DCKPT_PATH='"sentinel-huge.bin"' -o sentinel-huge main.c $(LDLIBS)
 
 ln: main.c             ## build with LayerNorm (sentinel-ln, faster convergence)
