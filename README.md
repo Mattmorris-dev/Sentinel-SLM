@@ -40,6 +40,7 @@ make && ./start.sh
 - [Shrink it to ship it — quantization](#shrink-it-to-ship-it--quantization)
 - [Training quality options](#training-quality-options)
 - [Optional online advisor (opt-in)](#optional-online-advisor-opt-in)
+- [Cluster & recursive learning](#cluster--recursive-learning)
 - [Architecture](#architecture)
 - [Safety](#safety)
 - [Free vs Pro](#free-vs-pro)
@@ -330,6 +331,23 @@ export ANTHROPIC_API_KEY=...          # required — unset = fully local, no net
 The request is built and JSON-escaped in C and sent via `curl` with the body in a temp
 file, so your question never touches a shell; the API key is read from the environment by
 `curl`, not by Sentinel.
+
+## Cluster & recursive learning
+
+Two ways to get more out of Sentinel without a bigger box — see **[`CLUSTER.md`](CLUSTER.md)**:
+
+- **`cluster.sh`** — fan `--agent` workers out across several machines over SSH (a
+  mix of Pis, a mini-PC, a laptop). A cluster runs *more agents at once*; it does
+  **not** make one model bigger (RNN/BPTT is latency-bound, so sharding one model
+  over a slow network is slower than one box — for a bigger single model, add RAM
+  to one machine, e.g. a 16 GB Pi 5).
+- **`recursive-learn.sh`** — the model generates text, then retrains on it **mixed
+  with the real corpus** (the anchor that prevents model collapse), round after
+  round. Uses the new `--generate` inference flag.
+
+> A GPU won't help today: Sentinel is pure C / CPU with no GPU code path, so using
+> one would need a CUDA port (a separate project). Details + the Pi PCIe/NVMe
+> reality are in [`CLUSTER.md`](CLUSTER.md).
 
 ## Architecture
 

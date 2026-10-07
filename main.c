@@ -1948,6 +1948,7 @@ static void print_usage(const char *prog) {
 "  %s --self-study [rounds]\n"
 "                            OPT-IN: the model asks Opus for ideas and LEARNS from\n"
 "                            the answers (updates its weights, never its code)\n"
+"  %s --generate [n] [seed]  print n chars from the checkpoint (no training)\n"
 "  %s --gradcheck          numerically verify backprop (build tiny first)\n"
 "  %s --help | -h          show this help\n"
 "  %s --version            print version\n"
@@ -1985,7 +1986,7 @@ static void print_usage(const char *prog) {
 "  Sub-agents run real shell commands but a hard guard refuses 'sudo' and\n"
 "  destructive patterns (rm -rf /, mkfs, dd, fork bombs, shutdown, ...).\n"
 "  Set SLM_NO_EXEC=1 to disable command execution entirely.\n",
-        VERSION, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog);
+        VERSION, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog);
 }
 
 int main(int argc, char **argv) {
@@ -2071,6 +2072,17 @@ int main(int argc, char **argv) {
         printf("Loaded quantized model '%s'. Sample (seeded 't'):\n  \"", argv[2]);
         sample('t', n);
         printf("\"\n");
+        return 0;
+    }
+
+    /* ---- pure inference: generate n chars from the checkpoint, no training ---- */
+    if (argc >= 2 && strcmp(argv[1], "--generate") == 0) {
+        if (!load_model(CKPT_PATH))
+            fprintf(stderr, "no checkpoint '%s' — generating from untrained weights\n", CKPT_PATH);
+        int n = (argc >= 3) ? atoi(argv[2]) : 400;
+        if (n <= 0) n = 400;
+        int seed = (argc >= 4 && argv[3][0]) ? (argv[3][0] & (VOCAB - 1)) : 't';
+        sample(seed, n);          /* prints n chars + newline to stdout */
         return 0;
     }
 

@@ -16,3 +16,8 @@ corpus/
 
 # Release tarballs
 *.tar.gz
+
+# cluster: your private node list + recursive self-corpus
+nodes
+self-corpus.txt
+self-corpus.txt.tmp

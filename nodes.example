@@ -1,0 +1,14 @@
+# Sentinel cluster nodes — copy this to `nodes` and edit.
+# One machine per line. Comments start with #.
+#
+#   user@host                 uses ~/sentinel on that host
+#   user@host:/path/to/dir    explicit working directory (where ./sentinel lives)
+#
+# Any mix of machines works — Raspberry Pis, a mini-PC, a laptop — as long as
+# you can `ssh` to them with key auth and each has the `sentinel` binary
+# (run `./cluster.sh deploy` to copy it out).
+
+pi@192.168.1.21
+pi@192.168.1.22:/opt/sentinel
+matt@minipc.local
+matt@laptop.local:~/code/sentinel
