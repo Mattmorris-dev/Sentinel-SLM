@@ -16,7 +16,7 @@ BIN      = sentinel
 PREFIX  ?= /usr/local
 VERSION ?= 0.6.0
 
-.PHONY: all both slm huge ln gradcheck run train quant pet-model fetch quick-fetch clean distclean install uninstall package help
+.PHONY: all both slm huge max ln gradcheck run train quant pet-model fetch quick-fetch clean distclean install uninstall package help
 
 all: $(BIN)            ## build the default ~50M model (plain gcc, runs anywhere)
 
@@ -36,6 +36,12 @@ slm: main.c            ## build a tiny SLM (sentinel-slm, ~1.2M params)
 huge: main.c           ## build the 8 GB Pi 5 flagship (sentinel-huge, ~142M params)
 	$(CC) -O2 -Wall $(LNFLAG) -mcmodel=large -DHIDDEN=2816 \
 	    -DCKPT_PATH='"sentinel-huge.bin"' -o sentinel-huge main.c $(LDLIBS)
+
+# Pushes an 8 GB Pi 5 to its limit: ~185M params, ~5.9 GB to train. Leaves only
+# ~1-1.5 GB headroom, so close other apps; train on a bigger box if you can.
+max: main.c            ## push an 8 GB Pi 5 (~185M params, ~5.9 GB train)
+	$(CC) -O2 -Wall $(LNFLAG) -mcmodel=large -DHIDDEN=3200 \
+	    -DCKPT_PATH='"sentinel-max.bin"' -o sentinel-max main.c $(LDLIBS)
 
 ln: main.c             ## build with LayerNorm (sentinel-ln, faster convergence)
 	$(CC) -O2 -Wall -DUSE_LN -DHIDDEN=256 -DEMBED=64 -DNUM_LAYERS=2 \
@@ -79,7 +85,7 @@ clean:                 ## remove the binary and checkpoint
 	rm -f $(BIN) sentinel.bin sentinel-int8.bin sentinel-1bit.bin \
 	    sentinel-pet-trainer sentinel-pet.bin sentinel-1bit-qat.bin \
 	    sentinel-int8-qat.bin export_model model.h \
-	    sentinel-ln sentinel-ln.bin sentinel-gradcheck
+	    sentinel-ln sentinel-ln.bin sentinel-max sentinel-max.bin sentinel-gradcheck
 
 distclean: clean       ## also remove the fetched corpus
 	rm -rf corpus

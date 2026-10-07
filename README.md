@@ -73,6 +73,12 @@ make && ./start.sh
 | `make slm` | ~0.8M | ~27 MB | — | a potato |
 | `make` (default) | ~58M | ~1.9 GB | — (plain gcc) | a Pi 4 / any laptop |
 | `make huge` | ~143M | ~4.6 GB | `-mcmodel=large` | **8 GB Pi 5** (flagship) / a server |
+| `make max` | ~185M | ~5.9 GB | `-mcmodel=large` | 8 GB Pi 5 pushed to the limit |
+
+Every build includes **LayerNorm by default** (it converges to a lower loss) — add
+`USE_LN=0` to any `make` target for the plain GRU. RAM shown is for *training*
+(Adam keeps ~32 bytes/param); inference needs far less, and an `int8` export less
+still (e.g. the `max` model is ~1.5 GB in f64 or ~185 MB as int8).
 
 One source, dimension-generic: pick the biggest that fits your RAM. Training is
 CPU-bound and slow at the top end (hours), so train on a fast box and ship a quantized
@@ -143,8 +149,9 @@ Or use the Makefile (`make help` lists everything):
 |---|---|
 | `make` | build the default ~58M model (`./sentinel`) |
 | `make slm` | build the small SLM (`./sentinel-slm`) |
-| `make huge` | build the 8 GB Pi 5 flagship (`./sentinel-huge`) |
-| `make ln` | build with LayerNorm (`./sentinel-ln`) — see [Training quality](#training-quality-options) |
+| `make huge` | build the 8 GB Pi 5 flagship (`./sentinel-huge`, ~143M) |
+| `make max` | push an 8 GB Pi 5 (`./sentinel-max`, ~185M, ~5.9 GB train) |
+| `make ln` | tiny LayerNorm SLM (`./sentinel-ln`) — LN is already on in every build |
 | `make quant` | export `int8` + `1-bit` copies of your trained model |
 | `make pet-model` | train the tiny on-device model with 1-bit QAT and emit `model.h` |
 | `make gradcheck` | numerically verify the backprop (tiny build + `--gradcheck`) |
@@ -278,15 +285,14 @@ firmware. `model.h` and trained `.bin` files are gitignored.
 
 ## Training quality options
 
-All of these are **off by default** — the standard build is unchanged — and every one is
-verified by the built-in gradient checker.
+Every one is verified by the built-in gradient checker.
 
 | Option | How | What it does |
 |---|---|---|
+| **LayerNorm** | **on by default** (`USE_LN=0` to disable) | normalizes each GRU gate's pre-activation with a learnable gain; converges faster (e.g. 3.28 vs 3.75 loss/char at the same budget) |
 | LR warmup | always on | linear warmup over the first 200 steps of a fresh model, then constant (so online learning keeps working) |
 | Auto-checkpoint | always on | saves every 2000 iterations of a long run (`-DCKPT_EVERY=N` to change) |
 | Learning rate | `SLM_LR=0.001` | override the base learning rate at runtime |
-| **LayerNorm** | `make ln` or `-DUSE_LN` | normalizes each GRU gate's pre-activation with a learnable gain; converges faster (e.g. 3.28 vs 3.75 loss/char at the same budget) |
 | **Weight tying** | `-DTIE_WEIGHTS -DEMBED=<HIDDEN>` | reuses the input embedding as the output projection; requires `EMBED == HIDDEN` |
 
 **Gradient check.** `make gradcheck` builds a tiny model and compares every analytic
