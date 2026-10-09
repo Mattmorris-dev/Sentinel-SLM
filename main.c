@@ -174,6 +174,7 @@ static double vgln[NUM_LAYERS][NGATE][HIDDEN];
 
 static long g_adam_t = 0;   /* Adam timestep, for bias correction */
 static double g_lr = LR;    /* effective learning rate (override via SLM_LR) */
+static double g_wd = 0.0;   /* decoupled weight decay (AdamW); enable via SLM_WD */
 static int  g_defer_adam = 0;  /* when set, train_step computes grads but skips Adam
                                 * (used by quantization-aware training) */
 
@@ -295,6 +296,7 @@ static void adam(double *p, double *g, double *m, double *v, int n,
         double mhat = m[i] / bc1;
         double vhat = v[i] / bc2;
         p[i] -= lr * mhat / (sqrt(vhat) + ADAM_EPS);
+        if (g_wd > 0.0) p[i] -= lr * g_wd * p[i];   /* AdamW decoupled weight decay */
     }
 }
 
@@ -1336,6 +1338,23 @@ static int classify_task(const char *task) {
     return 2;
 }
 
+/* Does this input look like an actionable task, so Sentinel should spawn a
+ * sub-agent for it even without an explicit "TASK:"? Conservative on purpose:
+ * the line must START with an imperative verb, so notes / prose fall through to
+ * online learning instead of running commands. `low` must be lowercased. */
+static int looks_like_task(const char *low) {
+    static const char *verbs[] = {
+        "scan ","list ","write ","find ","check ","show ","search ","hash ",
+        "compile ","analyze ","analyse ","build ","run ","enumerate ","detect ",
+        "fetch ","grep ","reverse ","encrypt ","decrypt ","lookup ", NULL };
+    while (*low == ' ') low++;
+    for (int i = 0; verbs[i]; i++) {
+        size_t n = strlen(verbs[i]);
+        if (strncmp(low, verbs[i], n) == 0) return 1;   /* starts with "verb " */
+    }
+    return 0;
+}
+
 /*
  * Build a concrete, safe shell command for a task.  `cmd` is filled in.
  * Returns the classification used.  For coding tasks it may first emit a
@@ -1966,6 +1985,8 @@ static void print_usage(const char *prog) {
 "                            to fetch it LIVE from the internet.\n"
 "  (each agent is auto-assigned a difficulty tier — light/medium/heavy — which\n"
 "   sets its compute/parameter budget; easy tasks get a smaller budget.)\n"
+"  <task-looking input>      auto-spawns a sub-agent (e.g. 'scan ...', 'write ...');\n"
+"                            set SLM_NO_AUTO=1 to disable and treat it as text\n"
 "  <any other text>          is absorbed as live training data (online learning)\n"
 "  Ctrl-D                    quit (the model is checkpointed on exit)\n"
 "\n"
@@ -1977,6 +1998,8 @@ static void print_usage(const char *prog) {
 "ENVIRONMENT VARIABLES\n"
 "  SLM_EPOCHS=N              training iterations (default 2000)\n"
 "  SLM_LR=F                  override the base learning rate (default 0.002)\n"
+"  SLM_WD=F                  AdamW weight decay for stronger generalization (default 0)\n"
+"  SLM_NO_AUTO=1             don't auto-spawn agents from task-looking input\n"
 "  SLM_NO_EXEC=1             agents PLAN ONLY — print commands, run nothing\n"
 "  ANTHROPIC_API_KEY=...     enables the OPT-IN online advisor (--ask-opus /\n"
 "                            --self-study). Unset = the core is 100%% local.\n"
@@ -2095,6 +2118,8 @@ int main(int argc, char **argv) {
     if (env_ep) { int v = atoi(env_ep); if (v > 0) iters = v; }
     const char *env_lr = getenv("SLM_LR");
     if (env_lr) { double v = atof(env_lr); if (v > 0.0) g_lr = v; }
+    const char *env_wd = getenv("SLM_WD");
+    if (env_wd) { double v = atof(env_wd); if (v >= 0.0) g_wd = v; }
 
     /* ---- self-study: learn neural-net/security ideas from Opus (opt-in) ---- */
     if (argc >= 2 && strcmp(argv[1], "--self-study") == 0) {
@@ -2201,6 +2226,9 @@ int main(int argc, char **argv) {
         for (size_t i = 0; i < ln; i++) low[i] = (char)tolower((unsigned char)line[i]);
         low[ln] = '\0';
         int is_cve_q = (!trig && !fan) && (strstr(low, "cve") || strstr(low, "vuln"));
+        /* auto-spawn when the line looks like a task (disable with SLM_NO_AUTO=1) */
+        int auto_task = (!trig && !fan && !is_cve_q) && !getenv("SLM_NO_AUTO")
+                        && looks_like_task(low);
 
         if (fan) {
             /* FANOUT: <count> <task>  — spawn up to 100 concurrent sub-agents */
@@ -2217,11 +2245,12 @@ int main(int argc, char **argv) {
             int n = spawn_batch(selfexe, p, count, tier);
             printf("[fan-out] %d sub-agents completed.\n", n);
             spawned += n;
-        } else if (trig || is_cve_q) {
+        } else if (trig || is_cve_q || auto_task) {
             char *task = trig ? trig + 5 : line;
             while (*task == ' ') task++;
             int tier = estimate_difficulty(task);
-            printf("[trigger detected] spawning sub-agent (tier=%s) for: \"%s\"\n",
+            printf("%s spawning sub-agent (tier=%s) for: \"%s\"\n",
+                   auto_task ? "[auto-agent: looks like a task]" : "[trigger detected]",
                    TIER_NAME[tier], task);
             fflush(stdout);
             spawn_agent_tier(selfexe, task, tier);
