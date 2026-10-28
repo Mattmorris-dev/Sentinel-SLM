@@ -7,9 +7,11 @@ the computer has and runs the **biggest model that fits**:
 | model | params | RAM to train | picked when the PC has about… |
 |-------|--------|--------------|-------------------------------|
 | slm   | ~0.8M  | 40 MB        | anything (always the fallback) |
-| std   | ~58M   | 1.9 GB       | 4 GB+ |
-| huge  | ~143M  | 4.6 GB       | 8 GB |
-| max   | ~185M  | 5.9 GB       | 8 GB+ |
+| std   | ~58M   | 1.9 GB       | 4 GB |
+| huge  | ~143M  | 4.6 GB       | 6 GB |
+| max   | ~185M  | 5.9 GB       | 8 GB |
+| xl    | ~383M  | 12.3 GB      | 16 GB |
+| xxl   | ~738M  | 23.6 GB      | 32 GB |
 
 Trained checkpoints on the stick are used before untrained ones. Older
 checkpoints still load, because the launcher reads each file's header and
@@ -33,8 +35,10 @@ sudo ./usb/build-iso.sh            # on Debian 13
 The result is written to `usb/build/out/sentinel-os-<version>-<edition>.iso`.
 
 To build in the cloud instead, move `usb/github-workflow.yml` to
-`.github/workflows/build-usb.yml`, push, then click **Run workflow** in the
-Actions tab. Both ISOs come back as downloadable artifacts.
+`.github/workflows/build-usb.yml` and push it (one time). Then open the
+repo's **Actions** tab, pick
+**Build Sentinel OS USB image**, and click **Run workflow** (pushing a `v*` tag
+also starts it). Both ISOs come back as downloadable artifacts, kept for 14 days.
 
 ## 2. Write a stick
 
@@ -48,6 +52,22 @@ learning carries over between reboots. It then copies your trained `.bin` files
 and corpus onto the stick. It refuses to touch the disk your system runs from
 and any disk that isn't removable (unless you pass `--force`), and it makes you
 type the device name before it writes. Use `--dry-run` to preview what it would do.
+
+### Which stick size?
+
+The image itself is small. What fills a stick is trained checkpoints (they
+hold the weights plus optimizer state, about 12 bytes per parameter) and the
+corpus. The persistence partition takes all the space left after the image.
+
+| stick | holds |
+|-------|-------|
+| 8 GB  | the image plus trained slm/std/huge/max checkpoints (~4.6 GB together) |
+| 32 GB | adds a trained **xl** (~4.4 GB) and a large corpus |
+| 64 GB | adds a trained **xxl** (~8.5 GB) too, so every tier is on one stick with plenty of room to keep learning |
+
+A bigger stick doesn't make a model smarter on its own. It lets you carry
+bigger trained models, and the PC's RAM still decides which one runs. Train
+xl and xxl on a 16 GB / 32 GB machine first, then load them with `--models`.
 
 If you only need a stick that boots, without models or persistence, any image
 writer works (Balena Etcher, Rufus in DD mode, `dd`).
@@ -85,4 +105,4 @@ app icon and boot menu are all generated from it.
 | `hook-sentinel.sh` | compiles every model inside the image at build time |
 | `sentinel-start` | launcher on the stick: RAM-aware model pick, imports checkpoints, modes `--gui/--tui/--loop/--learn/--recursive/--generate/--which` |
 | `sentinel-wallpaper` | applies the branded wallpaper on every monitor |
-| `github-workflow.yml` | optional cloud build (free editions only) |
+| `github-workflow.yml` | cloud build (free editions only, never add trained models) |

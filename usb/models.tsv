@@ -5,3 +5,5 @@ slm|sentinel-slm|sentinel-slm.bin|40|-DUSE_LN -DHIDDEN=256 -DEMBED=64 -DNUM_LAYE
 std|sentinel|sentinel.bin|1900|-DUSE_LN
 huge|sentinel-huge|sentinel-huge.bin|4600|-DUSE_LN -mcmodel=large -DHIDDEN=2816
 max|sentinel-max|sentinel-max.bin|5900|-DUSE_LN -mcmodel=large -DHIDDEN=3200
+xl|sentinel-xl|sentinel-xl.bin|12300|-DUSE_LN -mcmodel=large -DHIDDEN=4608
+xxl|sentinel-xxl|sentinel-xxl.bin|23600|-DUSE_LN -mcmodel=large -DHIDDEN=6400
