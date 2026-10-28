@@ -1,0 +1,7 @@
+# Standard Sentinel builds compiled into the image (from the latest main.c).
+# name|binary|checkpoint|train_ram_mb|cflags
+# The launcher picks the biggest one whose training RAM fits the PC it boots on.
+slm|sentinel-slm|sentinel-slm.bin|40|-DUSE_LN -DHIDDEN=256 -DEMBED=64 -DNUM_LAYERS=2
+std|sentinel|sentinel.bin|1900|-DUSE_LN
+huge|sentinel-huge|sentinel-huge.bin|4600|-DUSE_LN -mcmodel=large -DHIDDEN=2816
+max|sentinel-max|sentinel-max.bin|5900|-DUSE_LN -mcmodel=large -DHIDDEN=3200

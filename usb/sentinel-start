@@ -1,0 +1,173 @@
+#!/usr/bin/env bash
+# sentinel-start — the Sentinel OS launcher.
+#
+# Picks the biggest Sentinel model that fits THIS computer's RAM, imports any
+# trained checkpoints found on the USB stick, and builds a matching binary for
+# each one from the latest source (reads size + LayerNorm from the file header),
+# so older checkpoints keep working without retraining.
+#
+#   sentinel-start            web GUI in the browser (default; what the desktop autostarts)
+#   sentinel-start --tui      terminal UI
+#   sentinel-start --loop     interactive loop: chat, auto sub-agents, online learning
+#   sentinel-start --learn    train the picked model on the corpus (long-running)
+#   sentinel-start --recursive  recursive self-learning rounds (recursive-learn.sh)
+#   sentinel-start --generate [n]  print n characters from the picked model
+#   sentinel-start --which    show which model it picked and why
+#   sentinel-start -- <args>  pass args straight to the picked model binary
+#
+# Env: SENTINEL_MODEL=<name> forces a model; SENTINEL_HOME (data dir),
+#      SENTINEL_PORT (GUI port, 8080), SENTINEL_OPT (install dir, /opt/sentinel).
+set -uo pipefail
+
+OPT="${SENTINEL_OPT:-/opt/sentinel}"
+DATA="${SENTINEL_HOME:-$HOME/.local/share/sentinel}"
+MEMINFO="${SENTINEL_MEMINFO:-/proc/meminfo}"
+PORT="${SENTINEL_PORT:-8080}"
+MAGIC_SLM3=1397509427   # "SLM3" plain GRU checkpoint
+MAGIC_SLM4=1397509428   # "SLM4" LayerNorm checkpoint
+
+log() { echo "sentinel-start: $*" >&2; }
+mkdir -p "$DATA/bin" || { log "cannot create $DATA"; exit 1; }
+cd "$DATA" || exit 1
+
+# --- import trained checkpoints (image, USB data partition, or SENTINEL_MODELS) once
+import_models() {
+    local d f name
+    for d in "$OPT/models" /run/live/persistence/*/sentinel-models ${SENTINEL_MODELS:-}; do
+        [ -d "$d" ] || continue
+        for f in "$d"/*.bin; do
+            [ -f "$f" ] || continue
+            name="$(basename "$f" .bin | tr -c 'A-Za-z0-9_.\n-' '_')"
+            if [ ! -e "trained-$name.bin" ]; then
+                cp "$f" "trained-$name.bin" && log "imported trained model '$name' from $d"
+            fi
+        done
+    done
+}
+
+# --- link a corpus for retrieval/training if one shipped
+link_corpus() {
+    [ -e corpus ] && return 0
+    local d
+    for d in "$OPT/corpus" /run/live/persistence/*/sentinel-corpus; do
+        if [ -d "$d" ]; then ln -s "$d" corpus && log "using corpus at $d"; return 0; fi
+    done
+}
+
+# --- read a checkpoint header: "magic vocab embed hidden layers"
+hdr() { od -An -tu4 -N20 "$1" 2>/dev/null | tr -s ' ' | sed 's/^ //'; }
+
+# --- build (or reuse) a binary that matches a trained checkpoint.
+#     Prints "name|binary|train_ram_mb" on success.
+build_for() {
+    local f="$1" name m v e h l cflags p ram bin
+    name="${f#trained-}"; name="${name%.bin}"
+    read -r m v e h l <<<"$(hdr "$f")"
+    case "$m" in
+        "$MAGIC_SLM3") cflags="" ;;
+        "$MAGIC_SLM4") cflags="-DUSE_LN" ;;
+        *) log "skipping $f (not a Sentinel training checkpoint)"; return 1 ;;
+    esac
+    case "$v$e$h$l" in *[!0-9]*|'') return 1 ;; esac
+    p=$(( v*e + l*3*(2*h*h + h) + v*h + v ))
+    ram=$(( p * 32 / 1000000 ))
+    [ $(( p * 32 )) -gt 1900000000 ] && cflags="$cflags -mcmodel=large"
+    bin="$DATA/bin/sentinel-trained-$name"
+    if [ ! -x "$bin" ] || [ "$OPT/src/main.c" -nt "$bin" ]; then
+        log "building a binary for trained model '$name' (HIDDEN=$h LAYERS=$l) from the latest source..."
+        # shellcheck disable=SC2086
+        gcc -O2 $cflags -DVOCAB="$v" -DEMBED="$e" -DHIDDEN="$h" -DNUM_LAYERS="$l" \
+            -DCKPT_PATH="\"$f\"" -o "$bin" "$OPT/src/main.c" -lm || { log "build failed for $f"; return 1; }
+    fi
+    echo "trained-$name|$bin|$ram"
+}
+
+# --- choose the model
+mem_mb=$(( $(awk '/^MemTotal:/{print $2}' "$MEMINFO") / 1024 ))
+if [ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ] || command -v startxfce4 >/dev/null 2>&1; then
+    reserve=1500    # leave room for the desktop + browser
+else
+    reserve=600
+fi
+usable=$(( mem_mb - reserve ))
+
+PICK_NAME=""; PICK_BIN=""; PICK_RAM=0; PICK_WHY=""
+consider() {   # name bin ram why
+    local n="$1" b="$2" r="$3" why="$4"
+    [ -x "$b" ] || return 0
+    if [ -n "${SENTINEL_MODEL:-}" ]; then
+        [ "$n" = "$SENTINEL_MODEL" ] || return 0
+        PICK_NAME="$n"; PICK_BIN="$b"; PICK_RAM="$r"; PICK_WHY="forced by SENTINEL_MODEL"; return 0
+    fi
+    [ "$r" -le "$usable" ] || return 0
+    if [ -z "$PICK_NAME" ] || [ "$r" -gt "$PICK_RAM" ]; then
+        PICK_NAME="$n"; PICK_BIN="$b"; PICK_RAM="$r"; PICK_WHY="$why"
+    fi
+}
+
+pick_model() {
+    import_models
+    local f line n b r name bin _ckpt
+    # trained models win over untrained ones of any size
+    for f in trained-*.bin; do
+        [ -f "$f" ] || continue
+        line="$(build_for "$f")" || continue
+        IFS='|' read -r n b r <<<"$line"
+        consider "$n" "$b" "$r" "your trained model, fits ${mem_mb} MB RAM"
+    done
+    if [ -z "$PICK_NAME" ]; then
+        while IFS='|' read -r name bin _ckpt r _; do
+            case "$name" in ''|'#'*) continue ;; esac
+            consider "$name" "$OPT/bin/$bin" "$r" "largest standard model that fits ${mem_mb} MB RAM"
+        done < "$OPT/models.tsv"
+    fi
+    if [ -z "$PICK_NAME" ]; then
+        PICK_NAME="slm"; PICK_BIN="$OPT/bin/sentinel-slm"; PICK_RAM=40; PICK_WHY="fallback (very low RAM)"
+    fi
+}
+
+SLM_BIN="$OPT/bin/sentinel-slm"   # GUI/TUI agents don't touch the weights: use the tiny build
+
+start_gui() {
+    if ! curl -s -o /dev/null "http://127.0.0.1:$PORT/" 2>/dev/null; then
+        nohup "$SLM_BIN" --serve "$PORT" >"$DATA/gui.log" 2>&1 &
+        for _ in $(seq 1 50); do
+            curl -s -o /dev/null "http://127.0.0.1:$PORT/" 2>/dev/null && break
+            sleep 0.2
+        done
+    fi
+    local url="http://127.0.0.1:$PORT/"
+    if command -v firefox-esr >/dev/null 2>&1; then
+        firefox-esr --new-window "$url" >/dev/null 2>&1 &
+    elif command -v xdg-open >/dev/null 2>&1; then
+        xdg-open "$url" >/dev/null 2>&1 &
+    else
+        echo "Sentinel GUI running at $url"
+    fi
+}
+
+link_corpus
+mode="${1:---gui}"
+case "$mode" in
+    --gui)   start_gui ;;
+    --tui)   exec "$SLM_BIN" --tui ;;
+    --which)
+        pick_model
+        echo "RAM: ${mem_mb} MB  (reserving ${reserve} MB for the OS, ${usable} MB usable)"
+        echo "Picked: $PICK_NAME  -> $PICK_BIN  (~${PICK_RAM} MB to train)"
+        echo "Why: $PICK_WHY"
+        ;;
+    --loop)  pick_model; log "model: $PICK_NAME ($PICK_WHY)"; exec "$PICK_BIN" ;;
+    --learn)
+        pick_model; log "training $PICK_NAME ($PICK_WHY) — this can take a long time; Ctrl-C is safe (auto-checkpoints)"
+        if [ -e corpus ]; then exec "$PICK_BIN" --train corpus; else exec "$PICK_BIN" </dev/null; fi
+        ;;
+    --recursive)
+        pick_model; log "recursive self-learning with $PICK_NAME"
+        BIN="$PICK_BIN" CORPUS="${CORPUS:-corpus}" exec "$OPT/src/recursive-learn.sh"
+        ;;
+    --generate|--chat) pick_model; exec "$PICK_BIN" --generate "${2:-400}" ;;
+    --) shift; pick_model; exec "$PICK_BIN" "$@" ;;
+    -h|--help) sed -n '2,22p' "$0" ;;
+    *) pick_model; exec "$PICK_BIN" "$@" ;;
+esac

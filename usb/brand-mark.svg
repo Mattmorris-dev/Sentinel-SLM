@@ -1,0 +1,39 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="-6 -2 172 186" width="172" height="186" role="img" aria-label="Sentinel mark">
+  <!-- The Sentinel shield on its own (wallpaper / app icon / boot branding).
+       Rebrand the USB by swapping this file — see usb/brand.conf. -->
+  <defs>
+    <linearGradient id="edge" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#22d3ee"/>
+      <stop offset="1" stop-color="#34d399"/>
+    </linearGradient>
+    <radialGradient id="node" cx="0.5" cy="0.4" r="0.7">
+      <stop offset="0" stop-color="#a7f3d0"/>
+      <stop offset="1" stop-color="#22d3ee"/>
+    </radialGradient>
+    <filter id="glow" x="-40%" y="-40%" width="180%" height="180%">
+      <feGaussianBlur stdDeviation="3.2" result="b"/>
+      <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+  </defs>
+  <g filter="url(#glow)">
+    <path d="M80 6 L150 32 L150 96 Q150 150 80 174 Q10 150 10 96 L10 32 Z"
+          fill="#0b1426" stroke="url(#edge)" stroke-width="4"/>
+    <g stroke="url(#edge)" stroke-width="2" opacity="0.85">
+      <line x1="45" y1="58" x2="80" y2="48"/>
+      <line x1="45" y1="58" x2="80" y2="92"/>
+      <line x1="45" y1="112" x2="80" y2="48"/>
+      <line x1="45" y1="112" x2="80" y2="92"/>
+      <line x1="80" y1="48" x2="115" y2="70"/>
+      <line x1="80" y1="92" x2="115" y2="70"/>
+    </g>
+    <path d="M80 92 C 62 118, 98 118, 80 96" fill="none" stroke="#34d399" stroke-width="2.5" stroke-linecap="round"/>
+    <path d="M80 96 l -5 -2 l 4 6 z" fill="#34d399"/>
+    <g fill="url(#node)">
+      <circle cx="45" cy="58" r="7"/>
+      <circle cx="45" cy="112" r="7"/>
+      <circle cx="80" cy="48" r="7"/>
+      <circle cx="80" cy="92" r="7"/>
+      <circle cx="115" cy="70" r="8"/>
+    </g>
+  </g>
+</svg>

@@ -1,0 +1,30 @@
+# GitHub Actions: build the FREE Sentinel OS images in the cloud.
+# To enable: move this file to .github/workflows/build-usb.yml and push.
+# Then run it from the Actions tab ("Run workflow"), or push a v* tag.
+# Never add trained models here — this runs on a public repo.
+name: Build Sentinel OS USB image
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ['v*']
+
+jobs:
+  iso:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      matrix:
+        edition: [desktop, lite]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Free disk space
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL || true
+      - name: Build image (Debian 13 container)
+        run: |
+          if [ "${{ matrix.edition }}" = lite ]; then ./usb/build-in-docker.sh --lite; else ./usb/build-in-docker.sh; fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sentinel-os-${{ matrix.edition }}
+          path: usb/build/out/*
+          retention-days: 14

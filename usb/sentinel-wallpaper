@@ -1,0 +1,13 @@
+#!/bin/sh
+# Sets the Sentinel OS wallpaper on every XFCE monitor/workspace at login.
+# (XFCE names monitors per machine, so we set whatever it created.)
+img=/usr/share/backgrounds/sentinel-os.png
+command -v xfconf-query >/dev/null 2>&1 || exit 0
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+    props="$(xfconf-query -c xfce4-desktop -l 2>/dev/null | grep 'last-image$')"
+    if [ -n "$props" ]; then
+        for p in $props; do xfconf-query -c xfce4-desktop -p "$p" -s "$img"; done
+        exit 0
+    fi
+    sleep 1
+done

@@ -21,3 +21,6 @@ corpus/
 nodes
 self-corpus.txt
 self-corpus.txt.tmp
+
+# USB image build output
+usb/build/
