@@ -67,7 +67,7 @@ app icon and boot menu are all generated from it.
   `build-iso.sh --models DIR` and never upload it.
 - **GPL compliance.** The image is built from Debian, which is free software.
   Selling it is allowed, but you must offer the source. Every image ships
-  `/opt/sentinel/SOURCES.txt` saying where to get it. Build with
+  `/usr/share/doc/sentinel-os/SOURCES.txt` saying where to get it. Build with
   `--with-source` to also produce the matching source tarball to hand out on
   request.
 - **Trademarks.** Don't call the product "Debian", and don't use the Debian
