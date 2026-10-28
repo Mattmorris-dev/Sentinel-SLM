@@ -1,5 +1,6 @@
 # Sentinel — self-contained deep GRU agent in pure C.
-# Free software (Apache-2.0). No external ML libraries; only libc + libm.
+# Free software (Apache-2.0). No external ML libraries; only libc + libm + pthreads
+# (training uses every CPU core; SLM_THREADS=1 for single-core).
 
 CC      ?= gcc
 # The default ~50M-param model uses <2 GB of static arrays, so it builds with
@@ -11,7 +12,7 @@ CC      ?= gcc
 USE_LN  ?= 1
 LNFLAG   = $(if $(filter 0,$(USE_LN)),,-DUSE_LN)
 CFLAGS  ?= -O2 -Wall $(LNFLAG)
-LDLIBS   = -lm
+LDLIBS   = -lm -pthread
 BIN      = sentinel
 PREFIX  ?= /usr/local
 VERSION ?= 0.6.0

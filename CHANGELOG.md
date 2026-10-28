@@ -5,6 +5,20 @@ GitHub Release. Format loosely follows [Keep a Changelog](https://keepachangelog
 
 ---
 
+## Unreleased
+
+**Multi-core training.**
+
+- Training and generation now use every CPU core (a small built-in pthread pool,
+  no new dependencies). `SLM_THREADS=N` picks the thread count; `1` = single-core.
+- The backward pass reads weight matrices row by row instead of down columns,
+  which is cache-friendly and faster even on one core.
+- Results are **bit-identical** for any thread count: every sum is still added in
+  the same order, so existing checkpoints and `--gradcheck` are unaffected.
+- Measured on a 4-core machine, HIDDEN=1024 model: 4.7 s/step → 0.76 s/step
+  (6.1×: 1.6× from the cache fix, 3.8× from threads).
+- Builds link with `-pthread` (Makefile, `start.sh`, the USB image).
+
 ## v0.6.0
 
 **LayerNorm.**

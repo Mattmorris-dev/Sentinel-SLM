@@ -77,7 +77,7 @@ build_for() {
         log "building a binary for trained model '$name' (HIDDEN=$h LAYERS=$l) from the latest source..."
         # shellcheck disable=SC2086
         gcc -O2 $cflags -DVOCAB="$v" -DEMBED="$e" -DHIDDEN="$h" -DNUM_LAYERS="$l" \
-            -DCKPT_PATH="\"$f\"" -o "$bin" "$OPT/src/main.c" -lm || { log "build failed for $f"; return 1; }
+            -DCKPT_PATH="\"$f\"" -o "$bin" "$OPT/src/main.c" -lm -pthread || { log "build failed for $f"; return 1; }
     fi
     echo "trained-$name|$bin|$ram"
 }

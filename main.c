@@ -44,6 +44,8 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <pthread.h>
+#include <stdint.h>
 
 /* ------------------------------------------------------------------ */
 /*  Hyperparameters — raise these to grow the network's capacity.      */
@@ -210,15 +212,118 @@ static double rnd_uniform(double lo, double hi) {
 /*  Hand written — this is the core linear-algebra primitive, used for */
 /*  every layer at every timestep.  No BLAS, no libraries.             */
 /* ------------------------------------------------------------------ */
+/* ------------------------------------------------------------------ */
+/*  Multi-core: a tiny pthread pool. Each kernel splits its rows (or    */
+/*  columns) across cores, and every output element is still summed in  */
+/*  exactly the same order as a single-core loop, so training is        */
+/*  bit-identical for any thread count. SLM_THREADS=n sets the number   */
+/*  of threads (default: every core; 1 = single-core).                  */
+/* ------------------------------------------------------------------ */
+#define MAX_THREADS  64
+#define PAR_MIN_WORK 131072.0  /* multiply-adds below which threading costs more than it saves */
+typedef void (*range_fn)(void *ctx, int lo, int hi);
+
+static int             g_nthreads = 0;     /* 0 = pool not started yet */
+static pid_t           g_pool_pid = 0;     /* forked sub-agents run single-core */
+static pthread_mutex_t g_pool_mu   = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  g_pool_go   = PTHREAD_COND_INITIALIZER;
+static pthread_cond_t  g_pool_done = PTHREAD_COND_INITIALIZER;
+static range_fn        g_job_fn;
+static void           *g_job_ctx;
+static int             g_job_n, g_job_left;
+static long            g_job_gen = 0;
+
+static void chunk(int n, int part, int parts, int *lo, int *hi) {
+    *lo = (int)((long long)n * part / parts);
+    *hi = (int)((long long)n * (part + 1) / parts);
+}
+
+static void *pool_worker(void *arg) {
+    int id = (int)(intptr_t)arg;
+    long seen = 0;
+    pthread_mutex_lock(&g_pool_mu);
+    for (;;) {
+        while (g_job_gen == seen) pthread_cond_wait(&g_pool_go, &g_pool_mu);
+        seen = g_job_gen;
+        range_fn fn = g_job_fn; void *ctx = g_job_ctx; int n = g_job_n;
+        pthread_mutex_unlock(&g_pool_mu);
+        int lo, hi;
+        chunk(n, id, g_nthreads, &lo, &hi);
+        if (lo < hi) fn(ctx, lo, hi);
+        pthread_mutex_lock(&g_pool_mu);
+        if (--g_job_left == 0) pthread_cond_signal(&g_pool_done);
+    }
+    return NULL;
+}
+
+/* Threads usable right now: starts the pool on first use; a forked child
+ * (sub-agent) has no pool threads, so it runs single-core. */
+static int pool_threads(void) {
+    if (g_nthreads == 0) {
+        long n = sysconf(_SC_NPROCESSORS_ONLN);
+        const char *e = getenv("SLM_THREADS");
+        if (e && atoi(e) > 0) n = atoi(e);
+        if (n < 1) n = 1;
+        if (n > MAX_THREADS) n = MAX_THREADS;
+        g_nthreads = (int)n;
+        g_pool_pid = getpid();
+        pthread_attr_t a;
+        pthread_attr_init(&a);
+        pthread_attr_setstacksize(&a, (size_t)8 << 20);   /* kernels keep HIDDEN-sized scratch on the stack */
+        for (int i = 1; i < g_nthreads; i++) {
+            pthread_t t;
+            if (pthread_create(&t, &a, pool_worker, (void *)(intptr_t)i) != 0) { g_nthreads = i; break; }
+            pthread_detach(t);
+        }
+        pthread_attr_destroy(&a);
+    }
+    return getpid() == g_pool_pid ? g_nthreads : 1;
+}
+
+/* Run fn over [0,n) split across the pool; small jobs stay on this thread. */
+static void parallel_for(int n, double work, range_fn fn, void *ctx) {
+    if (work < PAR_MIN_WORK || pool_threads() <= 1) { fn(ctx, 0, n); return; }
+    pthread_mutex_lock(&g_pool_mu);
+    g_job_fn = fn; g_job_ctx = ctx; g_job_n = n;
+    g_job_left = g_nthreads - 1;
+    g_job_gen++;
+    pthread_cond_broadcast(&g_pool_go);
+    pthread_mutex_unlock(&g_pool_mu);
+    int lo, hi;
+    chunk(n, 0, g_nthreads, &lo, &hi);
+    if (lo < hi) fn(ctx, lo, hi);
+    pthread_mutex_lock(&g_pool_mu);
+    while (g_job_left > 0) pthread_cond_wait(&g_pool_done, &g_pool_mu);
+    pthread_mutex_unlock(&g_pool_mu);
+}
+
+/* o1 = M1*v1 and (optionally) o2 = M2*v2, both rows x cols, in one pass. */
+typedef struct { double *o1; const double *m1, *v1; double *o2; const double *m2, *v2; int cols; } MatvecJob;
+static void matvec_rows(void *p, int lo, int hi) {
+    const MatvecJob *jb = p;
+    for (int i = lo; i < hi; i++) {
+        const double *row = jb->m1 + (size_t)i * jb->cols;
+        double acc = 0.0;
+        for (int j = 0; j < jb->cols; j++)
+            acc += row[j] * jb->v1[j];
+        jb->o1[i] = acc;
+        if (jb->m2) {
+            row = jb->m2 + (size_t)i * jb->cols;
+            acc = 0.0;
+            for (int j = 0; j < jb->cols; j++)
+                acc += row[j] * jb->v2[j];
+            jb->o2[i] = acc;
+        }
+    }
+}
+static void matvec2(double *o1, const double *m1, const double *v1,
+                    double *o2, const double *m2, const double *v2, int rows, int cols) {
+    MatvecJob jb = { o1, m1, v1, o2, m2, v2, cols };
+    parallel_for(rows, (double)rows * cols * (m2 ? 2 : 1), matvec_rows, &jb);
+}
 static void matvec(double *out, const double *M, const double *v,
                    int rows, int cols) {
-    for (int i = 0; i < rows; i++) {
-        const double *row = M + (size_t)i * cols;
-        double acc = 0.0;
-        for (int j = 0; j < cols; j++)
-            acc += row[j] * v[j];
-        out[i] = acc;
-    }
+    matvec2(out, M, v, NULL, NULL, NULL, rows, cols);
 }
 
 /* Numerically stable softmax over n logits. */
@@ -285,9 +390,18 @@ static void init_weights(void) {
 /* ------------------------------------------------------------------ */
 /* Adam update with bias correction.  bc1 = 1-B1^t, bc2 = 1-B2^t are passed in
  * so they're computed once per step, not once per weight. */
+typedef struct { double *p, *g, *m, *v; double bc1, bc2, lr; } AdamJob;
+static void adam_range(void *ctx, int lo, int hi);
 static void adam(double *p, double *g, double *m, double *v, int n,
                  double bc1, double bc2, double lr) {
-    for (int i = 0; i < n; i++) {
+    AdamJob jb = { p, g, m, v, bc1, bc2, lr };
+    parallel_for(n, (double)n * 8, adam_range, &jb);
+}
+static void adam_range(void *ctx, int lo, int hi) {
+    const AdamJob *jb = ctx;
+    double *p = jb->p, *g = jb->g, *m = jb->m, *v = jb->v;
+    double bc1 = jb->bc1, bc2 = jb->bc2, lr = jb->lr;
+    for (int i = lo; i < hi; i++) {
         double grad = g[i];
         if (grad >  CLIP) grad =  CLIP;
         if (grad < -CLIP) grad = -CLIP;
@@ -303,9 +417,15 @@ static void adam(double *p, double *g, double *m, double *v, int n,
 /* Backprop one GRU gate: accumulate dWg/dUg/dbg, add input grad into dxin,
  * and return the recurrent grad drec = Ug^T * d (gradient w.r.t. the gate's
  * recurrent input vector). */
-static void gate_backward(int l, int gt, const double *d, const double *xin,
-                          const double *rec, double *dxin, double *drec) {
-    for (int i = 0; i < HIDDEN; i++) {
+typedef struct { int l, gt; const double *d, *xin, *rec; double *dxin, *drec; } GateJob;
+/* One thread's share: weight-grad rows [lo,hi) and input-grad columns [lo,hi).
+ * The column sums walk the weight rows contiguously, but each sum still adds
+ * its terms in row order i = 0..HIDDEN-1, as the plain column loop does. */
+static void gate_backward_range(void *ctx, int lo, int hi) {
+    const GateJob *jb = ctx;
+    int l = jb->l, gt = jb->gt;
+    const double *d = jb->d, *xin = jb->xin, *rec = jb->rec;
+    for (int i = lo; i < hi; i++) {
         double di = d[i];
 #ifndef USE_LN
         dbg[l][gt][i] += di;        /* with LN the bias grad is handled post-norm */
@@ -314,15 +434,20 @@ static void gate_backward(int l, int gt, const double *d, const double *xin,
         double *ur = &dUg[l][gt][i][0];
         for (int j = 0; j < HIDDEN; j++) { wr[j] += di * xin[j]; ur[j] += di * rec[j]; }
     }
-    for (int j = 0; j < HIDDEN; j++) {
-        double sx = 0.0, sr = 0.0;
-        for (int i = 0; i < HIDDEN; i++) {
-            sx += Wg[l][gt][i][j] * d[i];
-            sr += Ug[l][gt][i][j] * d[i];
-        }
-        dxin[j] += sx;
-        drec[j]  = sr;
+    double sx[HIDDEN], sr[HIDDEN];
+    for (int j = lo; j < hi; j++) { sx[j] = 0.0; sr[j] = 0.0; }
+    for (int i = 0; i < HIDDEN; i++) {
+        double di = d[i];
+        const double *w = &Wg[l][gt][i][0];
+        const double *u = &Ug[l][gt][i][0];
+        for (int j = lo; j < hi; j++) { sx[j] += w[j] * di; sr[j] += u[j] * di; }
     }
+    for (int j = lo; j < hi; j++) { jb->dxin[j] += sx[j]; jb->drec[j] = sr[j]; }
+}
+static void gate_backward(int l, int gt, const double *d, const double *xin,
+                          const double *rec, double *dxin, double *drec) {
+    GateJob jb = { l, gt, d, xin, rec, dxin, drec };
+    parallel_for(HIDDEN, 4.0 * HIDDEN * HIDDEN, gate_backward_range, &jb);
 }
 
 /* Apply one Adam step to every parameter from the accumulated gradients.
@@ -385,6 +510,27 @@ static void ln_gate_back(int l, int gt, int t, const double *da, double *dpre) {
 }
 #endif
 
+/* Output-layer backward for hidden columns [lo,hi): the weight-grad columns
+ * and dh += W^T dy (summed in vocab order i = 0..VOCAB-1, as before). */
+typedef struct { const double *dy, *top; double *dh; } OutJob;
+static void out_backward_range(void *ctx, int lo, int hi) {
+    const OutJob *jb = ctx;
+    double s[HIDDEN];
+    for (int j = lo; j < hi; j++) s[j] = 0.0;
+    for (int i = 0; i < VOCAB; i++) {
+        double dyi = jb->dy[i];
+#ifdef TIE_WEIGHTS
+        double *wr = &dWemb[i][0];   /* output grad flows into the embedding */
+        const double *w = &Wemb[i][0];
+#else
+        double *wr = &dWhy[i][0];
+        const double *w = &Why[i][0];
+#endif
+        for (int j = lo; j < hi; j++) { wr[j] += dyi * jb->top[j]; s[j] += w[j] * dyi; }
+    }
+    for (int j = lo; j < hi; j++) jb->dh[j] += s[j];
+}
+
 static double train_step(const int *inputs, const int *targets,
                          double hprev[NUM_LAYERS][HIDDEN]) {
     /* ---- forward ---- */
@@ -410,8 +556,7 @@ static double train_step(const int *inputs, const int *targets,
                 for (int j = 0; j < HIDDEN; j++) xin[j] = g_h[l - 1][t + 1][j];
             }
             /* update gate z */
-            matvec(wx, &Wg[l][GZ][0][0], xin, HIDDEN, HIDDEN);
-            matvec(uh, &Ug[l][GZ][0][0], hp,  HIDDEN, HIDDEN);
+            matvec2(wx, &Wg[l][GZ][0][0], xin, uh, &Ug[l][GZ][0][0], hp, HIDDEN, HIDDEN);
 #ifdef USE_LN
             for (int i = 0; i < HIDDEN; i++) pre[i] = wx[i] + uh[i];
             g_ln_rstd[l][GZ][t] = ln_forward(pre, g_ln_nhat[l][GZ][t]);
@@ -422,8 +567,7 @@ static double train_step(const int *inputs, const int *targets,
                 g_z[l][t][i] = sigmoid(wx[i] + uh[i] + bg[l][GZ][i]);
 #endif
             /* reset gate r */
-            matvec(wx, &Wg[l][GR][0][0], xin, HIDDEN, HIDDEN);
-            matvec(uh, &Ug[l][GR][0][0], hp,  HIDDEN, HIDDEN);
+            matvec2(wx, &Wg[l][GR][0][0], xin, uh, &Ug[l][GR][0][0], hp, HIDDEN, HIDDEN);
 #ifdef USE_LN
             for (int i = 0; i < HIDDEN; i++) pre[i] = wx[i] + uh[i];
             g_ln_rstd[l][GR][t] = ln_forward(pre, g_ln_nhat[l][GR][t]);
@@ -435,8 +579,7 @@ static double train_step(const int *inputs, const int *targets,
 #endif
             /* candidate n with reset-gated hidden: hr = r (.) h_prev */
             for (int i = 0; i < HIDDEN; i++) g_hr[l][t][i] = g_r[l][t][i] * hp[i];
-            matvec(wx, &Wg[l][GN][0][0], xin,        HIDDEN, HIDDEN);
-            matvec(uh, &Ug[l][GN][0][0], g_hr[l][t], HIDDEN, HIDDEN);
+            matvec2(wx, &Wg[l][GN][0][0], xin, uh, &Ug[l][GN][0][0], g_hr[l][t], HIDDEN, HIDDEN);
 #ifdef USE_LN
             for (int i = 0; i < HIDDEN; i++) pre[i] = wx[i] + uh[i];
             g_ln_rstd[l][GN][t] = ln_forward(pre, g_ln_nhat[l][GN][t]);
@@ -478,29 +621,13 @@ static double train_step(const int *inputs, const int *targets,
         dy[targets[t]] -= 1.0;
 
         const double *top = g_h[NUM_LAYERS - 1][t + 1];
-        for (int i = 0; i < VOCAB; i++) {
-            double dyi = dy[i];
-            dby[i] += dyi;
-#ifdef TIE_WEIGHTS
-            double *wr = &dWemb[i][0];   /* output grad flows into the embedding */
-#else
-            double *wr = &dWhy[i][0];
-#endif
-            for (int j = 0; j < HIDDEN; j++) wr[j] += dyi * top[j];
-        }
+        for (int i = 0; i < VOCAB; i++) dby[i] += dy[i];
 
         double dhtot[NUM_LAYERS][HIDDEN];
         for (int l = 0; l < NUM_LAYERS; l++)
             for (int i = 0; i < HIDDEN; i++) dhtot[l][i] = dh_next[l][i];
-        for (int j = 0; j < HIDDEN; j++) {
-            double s = 0.0;
-#ifdef TIE_WEIGHTS
-            for (int i = 0; i < VOCAB; i++) s += Wemb[i][j] * dy[i];
-#else
-            for (int i = 0; i < VOCAB; i++) s += Why[i][j] * dy[i];
-#endif
-            dhtot[NUM_LAYERS - 1][j] += s;
-        }
+        OutJob oj = { dy, top, dhtot[NUM_LAYERS - 1] };
+        parallel_for(HIDDEN, 2.0 * VOCAB * HIDDEN, out_backward_range, &oj);
 
         for (int l = NUM_LAYERS - 1; l >= 0; l--) {
             const double *hp = g_h[l][t];
@@ -704,8 +831,7 @@ static void sample(int seed, int n) {
             } else {
                 for (int j = 0; j < HIDDEN; j++) xin[j] = hnew[l - 1][j];
             }
-            matvec(wx, &Wg[l][GZ][0][0], xin, HIDDEN, HIDDEN);
-            matvec(uh, &Ug[l][GZ][0][0], hp,  HIDDEN, HIDDEN);
+            matvec2(wx, &Wg[l][GZ][0][0], xin, uh, &Ug[l][GZ][0][0], hp, HIDDEN, HIDDEN);
 #ifdef USE_LN
             for (int i = 0; i < HIDDEN; i++) pre[i] = wx[i] + uh[i];
             ln_forward(pre, nh);
@@ -713,8 +839,7 @@ static void sample(int seed, int n) {
 #else
             for (int i = 0; i < HIDDEN; i++) z[i]  = sigmoid(wx[i] + uh[i] + bg[l][GZ][i]);
 #endif
-            matvec(wx, &Wg[l][GR][0][0], xin, HIDDEN, HIDDEN);
-            matvec(uh, &Ug[l][GR][0][0], hp,  HIDDEN, HIDDEN);
+            matvec2(wx, &Wg[l][GR][0][0], xin, uh, &Ug[l][GR][0][0], hp, HIDDEN, HIDDEN);
 #ifdef USE_LN
             for (int i = 0; i < HIDDEN; i++) pre[i] = wx[i] + uh[i];
             ln_forward(pre, nh);
@@ -723,8 +848,7 @@ static void sample(int seed, int n) {
             for (int i = 0; i < HIDDEN; i++) rr[i] = sigmoid(wx[i] + uh[i] + bg[l][GR][i]);
 #endif
             for (int i = 0; i < HIDDEN; i++) hr[i] = rr[i] * hp[i];
-            matvec(wx, &Wg[l][GN][0][0], xin, HIDDEN, HIDDEN);
-            matvec(uh, &Ug[l][GN][0][0], hr,  HIDDEN, HIDDEN);
+            matvec2(wx, &Wg[l][GN][0][0], xin, uh, &Ug[l][GN][0][0], hr, HIDDEN, HIDDEN);
 #ifdef USE_LN
             for (int i = 0; i < HIDDEN; i++) pre[i] = wx[i] + uh[i];
             ln_forward(pre, nh);
@@ -1997,6 +2121,8 @@ static void print_usage(const char *prog) {
 "\n"
 "ENVIRONMENT VARIABLES\n"
 "  SLM_EPOCHS=N              training iterations (default 2000)\n"
+"  SLM_THREADS=N             CPU threads (default: every core; 1 = single-core;\n"
+"                            results are identical for any value)\n"
 "  SLM_LR=F                  override the base learning rate (default 0.002)\n"
 "  SLM_WD=F                  AdamW weight decay for stronger generalization (default 0)\n"
 "  SLM_NO_AUTO=1             don't auto-spawn agents from task-looking input\n"

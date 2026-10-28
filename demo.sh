@@ -16,7 +16,7 @@ command -v gcc >/dev/null || { echo "need gcc"; exit 1; }
 
 say "building the tiny SLM (~1.2M params, builds in a second)"
 [ -x ./sentinel-slm ] || gcc -O2 -Wall -DHIDDEN=256 -DEMBED=64 -DNUM_LAYERS=2 \
-    -DCKPT_PATH='"sentinel-slm.bin"' -o sentinel-slm main.c -lm
+    -DCKPT_PATH='"sentinel-slm.bin"' -o sentinel-slm main.c -lm -pthread
 
 if [ ! -d corpus ]; then
   say "fetching a small demo corpus (famous CVEs + malware/OSINT notes)"

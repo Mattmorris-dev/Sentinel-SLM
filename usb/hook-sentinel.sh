@@ -12,7 +12,7 @@ while IFS='|' read -r name bin ckpt ram cflags; do
     case "$name" in ''|'#'*) continue ;; esac
     echo "[sentinel] building $name (~${ram} MB to train): $cflags"
     # shellcheck disable=SC2086
-    gcc -O2 -Wall $cflags -DCKPT_PATH="\"$ckpt\"" -o "$S/bin/$bin" "$S/src/main.c" -lm
+    gcc -O2 -Wall $cflags -DCKPT_PATH="\"$ckpt\"" -o "$S/bin/$bin" "$S/src/main.c" -lm -pthread
 done < "$S/models.tsv"
 
 ln -sf /opt/sentinel/bin/sentinel "$R/usr/local/bin/sentinel"

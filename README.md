@@ -141,7 +141,7 @@ concurrent workers — all local):
 No dependencies beyond a C compiler and libm:
 
 ```sh
-gcc -O2 -Wall -o sentinel main.c -lm
+gcc -O2 -Wall -o sentinel main.c -lm -pthread
 ```
 
 Or use the Makefile (`make help` lists everything):
@@ -191,6 +191,7 @@ checkpoints.
 | Variable | Effect |
 |---|---|
 | `SLM_EPOCHS=N` | training iterations (default 2000) |
+| `SLM_THREADS=N` | CPU threads for training/inference (default: every core; `1` = single-core). Results are bit-identical for any value |
 | `SLM_LR=F` | override the base learning rate (default 0.002) |
 | `SLM_NO_EXEC=1` | agents plan only — print commands, run nothing |
 | `SLM_ONLINE=1` | allow live CVE lookup over the internet |
@@ -358,7 +359,7 @@ token --> [embedding] --> [GRU layer 0] --> [GRU layer 1] --> ... --> [softmax] 
 ```
 
 - **Resize it:** `NUM_LAYERS`, `HIDDEN`, `EMBED`, and `SEQ_LEN` are `-D`-overridable
-  (e.g. `gcc -O2 -DHIDDEN=512 -DNUM_LAYERS=4 -o sentinel main.c -lm`). The default build is
+  (e.g. `gcc -O2 -DHIDDEN=512 -DNUM_LAYERS=4 -o sentinel main.c -lm -pthread`). The default build is
   **3 GRU layers, HIDDEN=1792, EMBED=128 ≈ 58M parameters** (~1.9 GB RAM with Adam, ~32
   bytes/param). Parameters scale roughly with `NUM_LAYERS × HIDDEN²`; past ~2 GB of
   static arrays you need `-mcmodel=large`. Changing the architecture starts a fresh

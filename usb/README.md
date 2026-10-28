@@ -56,14 +56,14 @@ type the device name before it writes. Use `--dry-run` to preview what it would 
 ### Which stick size?
 
 The image itself is small. What fills a stick is trained checkpoints (they
-hold the weights plus optimizer state, about 12 bytes per parameter) and the
+hold the weights plus Adam optimizer state as 8-byte doubles, about 24 bytes per parameter) and the
 corpus. The persistence partition takes all the space left after the image.
 
 | stick | holds |
 |-------|-------|
-| 8 GB  | the image plus trained slm/std/huge/max checkpoints (~4.6 GB together) |
-| 32 GB | adds a trained **xl** (~4.4 GB) and a large corpus |
-| 64 GB | adds a trained **xxl** (~8.5 GB) too, so every tier is on one stick with plenty of room to keep learning |
+| 16 GB | the image plus trained slm/std/huge/max checkpoints (~9.3 GB together) |
+| 32 GB | adds a trained **xl** (~9.2 GB) |
+| 64 GB | adds a trained **xxl** (~17.7 GB) too, so every tier plus a large corpus fits on one stick |
 
 A bigger stick doesn't make a model smarter on its own. It lets you carry
 bigger trained models, and the PC's RAM still decides which one runs. Train
