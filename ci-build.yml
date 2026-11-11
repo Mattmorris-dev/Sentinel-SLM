@@ -20,8 +20,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Compile (warnings as errors)
-        run: gcc -O2 -Wall -Wextra -Werror -o sentinel main.c -lm -pthread
+      - name: Compile (warnings as errors) — LayerNorm default and plain GRU
+        run: |
+          gcc -O2 -Wall -Wextra -Werror -DUSE_LN -o sentinel main.c -lm -pthread
+          gcc -O2 -Wall -Wextra -Werror -o sentinel-plain main.c -lm -pthread
+
+      - name: Verify backprop numerically (both variants)
+        run: make gradcheck && make gradcheck USE_LN=0
 
       - name: Smoke test — help, version, agent + safety guard
         run: |

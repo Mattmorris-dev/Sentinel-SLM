@@ -45,6 +45,10 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <pthread.h>
+#include <poll.h>
+#include <errno.h>
+#include <time.h>
+#include <sys/time.h>
 #include <stdint.h>
 
 /* ------------------------------------------------------------------ */
@@ -462,17 +466,24 @@ static void apply_adam(void) {
     double lr = (g_adam_t < WARMUP) ? g_lr * (double)g_adam_t / (double)WARMUP : g_lr;
     adam(&Wemb[0][0], &dWemb[0][0], &mWemb[0][0], &vWemb[0][0], VOCAB * EMBED, bc1, bc2, lr);
     adam(&Why[0][0],  &dWhy[0][0],  &mWhy[0][0],  &vWhy[0][0],  VOCAB * HIDDEN, bc1, bc2, lr);
+    double wd = g_wd;       /* decay applies to weight matrices only: biases and */
+    g_wd = 0.0;             /* LayerNorm gains (which rest at 1, not 0) are exempt */
     adam(by, dby, mby, vby, VOCAB, bc1, bc2, lr);
+    g_wd = wd;
     for (int l = 0; l < NUM_LAYERS; l++) {
         adam(&Wg[l][0][0][0], &dWg[l][0][0][0], &mWg[l][0][0][0], &vWg[l][0][0][0],
              NGATE * HIDDEN * HIDDEN, bc1, bc2, lr);
         adam(&Ug[l][0][0][0], &dUg[l][0][0][0], &mUg[l][0][0][0], &vUg[l][0][0][0],
              NGATE * HIDDEN * HIDDEN, bc1, bc2, lr);
+        g_wd = 0.0;
         adam(&bg[l][0][0], &dbg[l][0][0], &mbg[l][0][0], &vbg[l][0][0], NGATE * HIDDEN, bc1, bc2, lr);
+        g_wd = wd;
     }
 #ifdef USE_LN
+    g_wd = 0.0;
     adam(&gln[0][0][0], &dgln[0][0][0], &mgln[0][0][0], &vgln[0][0][0],
          NUM_LAYERS * NGATE * HIDDEN, bc1, bc2, lr);
+    g_wd = wd;
 #endif
 }
 
@@ -710,14 +721,14 @@ static double train_step(const int *inputs, const int *targets,
 /* ------------------------------------------------------------------ */
 /*  Train on a text buffer for a number of iterations.                 */
 /* ------------------------------------------------------------------ */
-static void save_model(const char *path);   /* defined below; used for auto-save */
+static int save_model(const char *path);    /* defined below; used for auto-save */
 
 static void train(const char *data, int data_len, int iters, int verbose) {
     if (data_len < SEQ_LEN + 1) return;
     double hprev[NUM_LAYERS][HIDDEN];
     memset(hprev, 0, sizeof hprev);
     int p = 0;
-    double smooth = -1.0;
+    double ema = 0.0, corr = 1.0, smooth = 0.0;   /* bias-corrected running mean, ~100-iter window */
     int inputs[SEQ_LEN], targets[SEQ_LEN];
 
     for (int it = 0; it < iters; it++) {
@@ -728,13 +739,15 @@ static void train(const char *data, int data_len, int iters, int verbose) {
         }
         double loss = train_step(inputs, targets, hprev);
         double per_char = loss / SEQ_LEN;
-        smooth = (smooth < 0.0) ? per_char : 0.999 * smooth + 0.001 * per_char;
+        ema = 0.99 * ema + 0.01 * per_char;
+        corr *= 0.99;
+        smooth = ema / (1.0 - corr);
         p += SEQ_LEN;
         if (verbose && (it % 200 == 0 || it == iters - 1))
             printf("  iter %5d/%d   loss/char = %.4f\n", it, iters, smooth);
         if (verbose && it > 0 && it % CKPT_EVERY == 0) {
-            save_model(CKPT_PATH);          /* crash-safety for long runs */
-            printf("  [auto-saved checkpoint at iter %d]\n", it);
+            if (save_model(CKPT_PATH))      /* crash-safety for long runs */
+                printf("  [auto-saved checkpoint at iter %d]\n", it);
         }
     }
 }
@@ -884,75 +897,90 @@ static void sample(int seed, int n) {
 /*  runs.  The architecture dims are written in a header; on a mismatch  */
 /*  we fall back to a fresh initialisation rather than load garbage.    */
 /* ------------------------------------------------------------------ */
-static void save_model(const char *path) {
-    FILE *f = fopen(path, "wb");
-    if (!f) return;
-    unsigned hdr[6] = { CKPT_MAGIC, VOCAB, EMBED, HIDDEN, NUM_LAYERS, 0 };
-    fwrite(hdr, sizeof(unsigned), 6, f);
-    fwrite(Wemb, sizeof Wemb, 1, f);
-    fwrite(Wg,   sizeof Wg,   1, f);
-    fwrite(Ug,   sizeof Ug,   1, f);
-    fwrite(bg,   sizeof bg,   1, f);
-    fwrite(Why,  sizeof Why,  1, f);
-    fwrite(by,   sizeof by,   1, f);
-    fwrite(mWemb, sizeof mWemb, 1, f);
-    fwrite(mWg,   sizeof mWg,   1, f);
-    fwrite(mUg,   sizeof mUg,   1, f);
-    fwrite(mbg,   sizeof mbg,   1, f);
-    fwrite(mWhy,  sizeof mWhy,  1, f);
-    fwrite(mby,   sizeof mby,   1, f);
-    fwrite(vWemb, sizeof vWemb, 1, f);
-    fwrite(vWg,   sizeof vWg,   1, f);
-    fwrite(vUg,   sizeof vUg,   1, f);
-    fwrite(vbg,   sizeof vbg,   1, f);
-    fwrite(vWhy,  sizeof vWhy,  1, f);
-    fwrite(vby,   sizeof vby,   1, f);
+/* Every tensor in the checkpoint, in file order (after the 24-byte header,
+ * before the Adam step counter). */
+typedef struct { void *p; size_t n; } CkptBlob;
+static int ckpt_blobs(CkptBlob *b) {
+    int k = 0;
+#define BLOB(a) (b[k].p = (a), b[k].n = sizeof (a), k++)
+    BLOB(Wemb);  BLOB(Wg);  BLOB(Ug);  BLOB(bg);  BLOB(Why);  BLOB(by);
+    BLOB(mWemb); BLOB(mWg); BLOB(mUg); BLOB(mbg); BLOB(mWhy); BLOB(mby);
+    BLOB(vWemb); BLOB(vWg); BLOB(vUg); BLOB(vbg); BLOB(vWhy); BLOB(vby);
 #ifdef USE_LN
-    fwrite(gln,  sizeof gln,  1, f);
-    fwrite(mgln, sizeof mgln, 1, f);
-    fwrite(vgln, sizeof vgln, 1, f);
+    BLOB(gln); BLOB(mgln); BLOB(vgln);
 #endif
-    fwrite(&g_adam_t, sizeof g_adam_t, 1, f);
-    fclose(f);
+#undef BLOB
+    return k;
+}
+#define CKPT_MAX_BLOBS 24
+
+/* Written to "<path>.tmp" and renamed into place only once every byte is on
+ * disk, so a crash or a full disk mid-save can't destroy the last good
+ * checkpoint. Returns 1 on success. */
+static int save_model(const char *path) {
+    char tmp[PATH_MAX + 8];
+    if (snprintf(tmp, sizeof tmp, "%s.tmp", path) >= (int)sizeof tmp) return 0;
+    FILE *f = fopen(tmp, "wb");
+    if (!f) { fprintf(stderr, "checkpoint: cannot write '%s': %s\n", tmp, strerror(errno)); return 0; }
+    unsigned hdr[6] = { CKPT_MAGIC, VOCAB, EMBED, HIDDEN, NUM_LAYERS, 0 };
+    CkptBlob b[CKPT_MAX_BLOBS];
+    int nb = ckpt_blobs(b);
+    int64_t step = g_adam_t;
+    int ok = fwrite(hdr, sizeof(unsigned), 6, f) == 6;
+    for (int i = 0; i < nb && ok; i++) ok = fwrite(b[i].p, b[i].n, 1, f) == 1;
+    ok = ok && fwrite(&step, sizeof step, 1, f) == 1;
+    ok = (fclose(f) == 0) && ok;
+    if (ok && rename(tmp, path) != 0) ok = 0;
+    if (!ok) {
+        fprintf(stderr, "checkpoint: saving '%s' FAILED (%s) — the previous file is untouched\n",
+                path, strerror(errno));
+        unlink(tmp);
+    }
+    return ok;
 }
 
+/* Returns 1 = loaded, 0 = no file there, -1 = a file is there but it can't be
+ * used (other architecture / LayerNorm setting, truncated, corrupt). On -1 the
+ * weights are left freshly initialised and the reason is printed; callers must
+ * not go on to train and save over that file. */
 static int load_model(const char *path) {
     FILE *f = fopen(path, "rb");
     if (!f) return 0;
+    CkptBlob b[CKPT_MAX_BLOBS];
+    int nb = ckpt_blobs(b);
+    long long want = 6 * (long long)sizeof(unsigned);
+    for (int i = 0; i < nb; i++) want += (long long)b[i].n;
+
+    const char *why = NULL;
     unsigned hdr[6];
-    if (fread(hdr, sizeof(unsigned), 6, f) != 6 ||
-        hdr[0] != CKPT_MAGIC || hdr[1] != VOCAB || hdr[2] != EMBED ||
-        hdr[3] != HIDDEN || hdr[4] != NUM_LAYERS) {
-        fclose(f);
-        return 0;   /* architecture changed -> start fresh, safely */
+    struct stat st;
+    if (fread(hdr, sizeof(unsigned), 6, f) != 6)       why = "too short to be a checkpoint";
+    else if (hdr[0] != CKPT_MAGIC)
+        why = "wrong format tag (built with a different LayerNorm setting, or not a Sentinel checkpoint)";
+    else if (hdr[1] != VOCAB || hdr[2] != EMBED || hdr[3] != HIDDEN || hdr[4] != NUM_LAYERS)
+        why = "made for a different model size";
+    else if (fstat(fileno(f), &st) != 0)               why = "cannot stat";
+    /* the step counter is 8 bytes, or 4 from a 32-bit build */
+    else if ((long long)st.st_size != want + 8 && (long long)st.st_size != want + 4)
+        why = "wrong length (truncated or corrupt)";
+    if (why && hdr[0] == CKPT_MAGIC && !strstr(why, "format") && !strstr(why, "short"))
+        fprintf(stderr, "checkpoint '%s': header is VOCAB=%u EMBED=%u HIDDEN=%u LAYERS=%u, "
+                "this build is %d/%d/%d/%d\n", path, hdr[1], hdr[2], hdr[3], hdr[4],
+                VOCAB, EMBED, HIDDEN, NUM_LAYERS);
+    if (!why) {
+        int ok = 1;
+        for (int i = 0; i < nb && ok; i++) ok = fread(b[i].p, b[i].n, 1, f) == 1;
+        int64_t step = 0;
+        if (ok && (long long)st.st_size == want + 8) ok = fread(&step, 8, 1, f) == 1;
+        else if (ok) { int32_t s32 = 0; ok = fread(&s32, 4, 1, f) == 1; step = s32; }
+        if (ok && (step < 0 || step > (int64_t)1 << 40)) ok = 0;
+        if (ok) g_adam_t = (long)step;
+        else { why = "unreadable or corrupt"; init_weights(); }   /* drop any half-loaded tensors */
     }
-    int ok = 1;
-    ok &= fread(Wemb, sizeof Wemb, 1, f) == 1;
-    ok &= fread(Wg,   sizeof Wg,   1, f) == 1;
-    ok &= fread(Ug,   sizeof Ug,   1, f) == 1;
-    ok &= fread(bg,   sizeof bg,   1, f) == 1;
-    ok &= fread(Why,  sizeof Why,  1, f) == 1;
-    ok &= fread(by,   sizeof by,   1, f) == 1;
-    ok &= fread(mWemb, sizeof mWemb, 1, f) == 1;
-    ok &= fread(mWg,   sizeof mWg,   1, f) == 1;
-    ok &= fread(mUg,   sizeof mUg,   1, f) == 1;
-    ok &= fread(mbg,   sizeof mbg,   1, f) == 1;
-    ok &= fread(mWhy,  sizeof mWhy,  1, f) == 1;
-    ok &= fread(mby,   sizeof mby,   1, f) == 1;
-    ok &= fread(vWemb, sizeof vWemb, 1, f) == 1;
-    ok &= fread(vWg,   sizeof vWg,   1, f) == 1;
-    ok &= fread(vUg,   sizeof vUg,   1, f) == 1;
-    ok &= fread(vbg,   sizeof vbg,   1, f) == 1;
-    ok &= fread(vWhy,  sizeof vWhy,  1, f) == 1;
-    ok &= fread(vby,   sizeof vby,   1, f) == 1;
-#ifdef USE_LN
-    ok &= fread(gln,  sizeof gln,  1, f) == 1;
-    ok &= fread(mgln, sizeof mgln, 1, f) == 1;
-    ok &= fread(vgln, sizeof vgln, 1, f) == 1;
-#endif
-    ok &= fread(&g_adam_t, sizeof g_adam_t, 1, f) == 1;
     fclose(f);
-    return ok;
+    if (!why) return 1;
+    fprintf(stderr, "checkpoint '%s' is not usable by this build: %s\n", path, why);
+    return -1;
 }
 
 /* ================================================================== */
@@ -975,6 +1003,14 @@ static int load_model(const char *path) {
 /*  build must stay under the 2 GB static-data limit).                  */
 /* ================================================================== */
 #define QUANT_MAGIC 0x534C4D51u   /* "SLMQ" — quantized export format */
+/* Header word 6 is a flags word: bit 0 is always set (it was the constant 1
+ * in the first format); bit 1 says the LayerNorm gains follow the biases. */
+#define QUANT_FLAG_LN 2u
+#ifdef USE_LN
+#define QUANT_FLAGS (1u | QUANT_FLAG_LN)
+#else
+#define QUANT_FLAGS 1u
+#endif
 
 /* Write one row-major tensor (rows x cols) to f, quantized per row. */
 static int quant_write_tensor(FILE *f, const double *M, int rows, int cols, int qmode) {
@@ -1056,7 +1092,7 @@ static int save_quant(const char *path, int qmode) {
     }
     FILE *f = fopen(path, "wb");
     if (!f) return 0;
-    unsigned hdr[7] = { QUANT_MAGIC, (unsigned)qmode, VOCAB, EMBED, HIDDEN, NUM_LAYERS, 1u };
+    unsigned hdr[7] = { QUANT_MAGIC, (unsigned)qmode, VOCAB, EMBED, HIDDEN, NUM_LAYERS, QUANT_FLAGS };
     fwrite(hdr, sizeof(unsigned), 7, f);
     int ok = 1;
     ok &= quant_write_tensor(f, &Wemb[0][0], VOCAB, EMBED, qmode);
@@ -1068,7 +1104,11 @@ static int save_quant(const char *path, int qmode) {
     ok &= quant_write_tensor(f, &Why[0][0], VOCAB, HIDDEN, qmode);
     f32_write(f, &bg[0][0][0], NUM_LAYERS * NGATE * HIDDEN);   /* biases: full precision */
     f32_write(f, by, VOCAB);
-    fclose(f);
+#ifdef USE_LN
+    f32_write(f, &gln[0][0][0], NUM_LAYERS * NGATE * HIDDEN);  /* LayerNorm gains */
+#endif
+    ok = !ferror(f) && ok;
+    ok = (fclose(f) == 0) && ok;
     return ok;
 }
 
@@ -1084,6 +1124,18 @@ static int load_quant(const char *path) {
         return 0;   /* wrong format or architecture -> caller handles it */
     }
     int qmode = (int)hdr[1], ok = 1;
+    unsigned flags = hdr[6];
+    if ((qmode != 1 && qmode != 8) || !(flags & 1u) || (flags & ~(1u | QUANT_FLAG_LN))) {
+        fclose(f);
+        return 0;   /* unknown precision or a newer format */
+    }
+#ifndef USE_LN
+    if (flags & QUANT_FLAG_LN) {
+        fprintf(stderr, "'%s' is a LayerNorm model; this binary was built without LayerNorm\n", path);
+        fclose(f);
+        return 0;
+    }
+#endif
     ok &= quant_read_tensor(f, &Wemb[0][0], VOCAB, EMBED, qmode);
     for (int l = 0; l < NUM_LAYERS && ok; l++)
         for (int g = 0; g < NGATE && ok; g++) {
@@ -1093,6 +1145,16 @@ static int load_quant(const char *path) {
     ok &= quant_read_tensor(f, &Why[0][0], VOCAB, HIDDEN, qmode);
     ok &= f32_read(f, &bg[0][0][0], NUM_LAYERS * NGATE * HIDDEN);
     ok &= f32_read(f, by, VOCAB);
+#ifdef USE_LN
+    if (flags & QUANT_FLAG_LN) {
+        ok &= f32_read(f, &gln[0][0][0], NUM_LAYERS * NGATE * HIDDEN);
+    } else {            /* export from before the gains were stored: assume identity */
+        fprintf(stderr, "note: '%s' predates LayerNorm-gain export; re-export it for full quality\n", path);
+        for (int l = 0; l < NUM_LAYERS; l++)
+            for (int g = 0; g < NGATE; g++)
+                for (int i = 0; i < HIDDEN; i++) gln[l][g][i] = 1.0;
+    }
+#endif
     fclose(f);
     return ok;
 }
@@ -1178,7 +1240,7 @@ static void qat_train(const char *data, int data_len, int iters, int qmode) {
     double hprev[NUM_LAYERS][HIDDEN];
     memset(hprev, 0, sizeof hprev);
     int p = 0, inputs[SEQ_LEN], targets[SEQ_LEN];
-    double smooth = -1.0;
+    double ema = 0.0, corr = 1.0, smooth = 0.0;   /* bias-corrected running mean, ~100-iter window */
     for (int it = 0; it < iters; it++) {
         if (p + SEQ_LEN + 1 >= data_len) { p = 0; memset(hprev, 0, sizeof hprev); }
         for (int k = 0; k < SEQ_LEN; k++) {
@@ -1187,13 +1249,15 @@ static void qat_train(const char *data, int data_len, int iters, int qmode) {
         }
         double loss = qat_step(inputs, targets, hprev, qmode, sWemb, sWg, sUg, sWhy);
         double per_char = loss / SEQ_LEN;
-        smooth = (smooth < 0.0) ? per_char : 0.999 * smooth + 0.001 * per_char;
+        ema = 0.99 * ema + 0.01 * per_char;
+        corr *= 0.99;
+        smooth = ema / (1.0 - corr);
         p += SEQ_LEN;
         if (it % 200 == 0 || it == iters - 1)
             printf("  qat iter %5d/%d   loss/char = %.4f\n", it, iters, smooth);
         if (it > 0 && it % CKPT_EVERY == 0) {
-            save_model(CKPT_PATH);          /* crash-safety: save latent weights */
-            printf("  [auto-saved latent checkpoint at iter %d]\n", it);
+            if (save_model(CKPT_PATH))      /* crash-safety: save latent weights */
+                printf("  [auto-saved latent checkpoint at iter %d]\n", it);
         }
     }
     free(sWemb); free(sWg); free(sUg); free(sWhy);
@@ -1260,12 +1324,14 @@ static int json_extract_text(const char *resp, char *out, size_t outsz) {
                 case '\\': out[o++] = '\\'; break;
                 case '/': out[o++] = '/';  break;
                 case 'u': {
-                    char hex[5] = { k[1], k[2], k[3], k[4], 0 };
-                    long cp = (k[1] && k[2] && k[3] && k[4]) ? strtol(hex, NULL, 16) : 0;
+                    int full = k[1] && k[2] && k[3] && k[4];   /* never read past the NUL */
+                    char hex[5] = { 0, 0, 0, 0, 0 };
+                    if (full) memcpy(hex, k + 1, 4);
+                    long cp = full ? strtol(hex, NULL, 16) : 0;
                     if (cp < 0x80) out[o++] = (char)cp;
                     else if (cp < 0x800) { out[o++] = (char)(0xC0 | (cp >> 6)); out[o++] = (char)(0x80 | (cp & 0x3F)); }
                     else { out[o++] = (char)(0xE0 | (cp >> 12)); out[o++] = (char)(0x80 | ((cp >> 6) & 0x3F)); out[o++] = (char)(0x80 | (cp & 0x3F)); }
-                    if (k[1] && k[2] && k[3] && k[4]) k += 4;
+                    if (full) k += 4;
                     break;
                 }
                 default: out[o++] = *k; break;
@@ -1310,25 +1376,40 @@ static int ask_opus(const char *question, const char *system_prompt,
         esc_m, esc_s, esc_q);
     fclose(bf);
 
-    /* API key stays in the environment; only fixed strings + our temp path
-     * reach the shell. The request body is @file, so the question is never
-     * on the command line. */
+    /* The API key goes into a private (0600) curl config file, not onto the
+     * command line, so it never shows up in `ps`. Only fixed strings + our
+     * temp paths reach the shell; the request body is @file. */
+    const char *key = getenv("ANTHROPIC_API_KEY");
+    if (strpbrk(key, "\"\\\r\n")) {
+        unlink(tmpl); snprintf(answer, ansz, "ANTHROPIC_API_KEY contains invalid characters"); return -1;
+    }
+    char ktmpl[] = "/tmp/sentinel_key_XXXXXX";
+    int kfd = mkstemp(ktmpl);
+    FILE *kf = kfd >= 0 ? fdopen(kfd, "w") : NULL;
+    if (!kf) {
+        if (kfd >= 0) { close(kfd); unlink(ktmpl); }
+        unlink(tmpl); snprintf(answer, ansz, "could not create a temp config file"); return -1;
+    }
+    fprintf(kf, "header = \"x-api-key: %s\"\n", key);
+    fclose(kf);
+
     char cmd[4096];
     snprintf(cmd, sizeof cmd,
         "curl -s --max-time 60 %s "
+        "-K %s "
         "-H 'content-type: application/json' "
-        "-H \"x-api-key: $ANTHROPIC_API_KEY\" "
         "-H 'anthropic-version: 2023-06-01' "
         "--data-binary @%s",
-        OPUS_ENDPOINT, tmpl);
+        OPUS_ENDPOINT, ktmpl, tmpl);
 
     FILE *pp = popen(cmd, "r");
-    if (!pp) { unlink(tmpl); snprintf(answer, ansz, "could not launch curl (is it installed?)"); return -1; }
+    if (!pp) { unlink(tmpl); unlink(ktmpl); snprintf(answer, ansz, "could not launch curl (is it installed?)"); return -1; }
     static char resp[1 << 16];
     size_t rn = fread(resp, 1, sizeof resp - 1, pp);
     resp[rn] = '\0';
     pclose(pp);
     unlink(tmpl);
+    unlink(ktmpl);
 
     if (rn == 0) { snprintf(answer, ansz, "empty response (network blocked, or curl missing?)"); return -1; }
     if (!json_extract_text(resp, answer, ansz)) {
@@ -1481,8 +1562,9 @@ static int looks_like_task(const char *low) {
 
 /*
  * Build a concrete, safe shell command for a task.  `cmd` is filled in.
- * Returns the classification used.  For coding tasks it may first emit a
- * small C snippet to /tmp via plain C file I/O, then compile + run it.
+ * Returns the classification used.  For coding tasks it first emits a small
+ * C snippet into a private temp dir (returned in `tmpdir`, for the caller to
+ * remove with cleanup_tmpdir) — unless `plan_only`, which touches nothing.
  */
 /*
  * Pull safe search keywords out of a task string: alphanumeric tokens of
@@ -1518,7 +1600,11 @@ static void extract_keywords(const char *task, char *out, size_t outsz) {
         snprintf(out, outsz, "android|ios|mobile|bluetooth|wifi|kernel|webkit");
 }
 
-static int build_command(const char *task, char *cmd, size_t cmdsz) {
+static int g_cmd_is_lookup = 0;   /* last build_command produced a corpus search */
+static int build_command(const char *task, char *cmd, size_t cmdsz,
+                         char *tmpdir, size_t tmpsz, int plan_only) {
+    if (tmpsz) tmpdir[0] = '\0';
+    g_cmd_is_lookup = 0;
     int kind = classify_task(task);
     char low[512];
     size_t n = strlen(task);
@@ -1562,8 +1648,13 @@ static int build_command(const char *task, char *cmd, size_t cmdsz) {
                  strstr(low,"yara")||strstr(low,"trojan"))         topic = "malware";
         else if (strstr(low,"osint")||strstr(low,"recon")||
                  strstr(low,"subdomain")||strstr(low,"breach"))    topic = "osint";
+        /* The keywords travel in the environment, not in the command text, so
+         * the safety guard judges only the fixed template: a lookup about
+         * "sudo" or "pkexec" is a search, not a command. */
         char kw[256];
         extract_keywords(task, kw, sizeof kw);
+        setenv("SLM_KW", kw, 1);
+        g_cmd_is_lookup = 1;
         snprintf(cmd, cmdsz,
             /* live internet fetch of a specific CVE id (opt-in via SLM_ONLINE) */
             "if [ -n \"$SLM_ONLINE\" ] && [ -n '%s' ] && command -v curl >/dev/null; then "
@@ -1573,17 +1664,17 @@ static int build_command(const char *task, char *cmd, size_t cmdsz) {
             "  | sed -n '1,18p'; echo; fi; "
             /* local corpus retrieval (works fully offline) */
             "dir=corpus; [ -d \"$dir\" ] || dir=.; topic=%s; "
-            "echo \"[retrieval agent] topic=$topic  searching $dir for: %s\"; "
+            "echo \"[retrieval agent] topic=$topic  searching $dir for: $SLM_KW\"; "
             "sub=$(ls -d \"$dir\"/*\"$topic\"* 2>/dev/null | head -1); "
             "[ -n \"$sub\" ] && dir=\"$sub\"; "
-            "hits=$(grep -rIl -i -E '%s' \"$dir\" --include='*.md' 2>/dev/null | head -3); "
-            "[ -z \"$hits\" ] && hits=$(grep -rIl -i -E '%s' corpus 2>/dev/null --include='*.md' | head -3); "
+            "hits=$(grep -rIl -i -E \"$SLM_KW\" \"$dir\" --include='*.md' 2>/dev/null | head -3); "
+            "[ -z \"$hits\" ] && hits=$(grep -rIl -i -E \"$SLM_KW\" corpus 2>/dev/null --include='*.md' | head -3); "
             "if [ -z \"$hits\" ]; then "
             "echo 'no local match — run ./fetch_corpus.sh, or set SLM_ONLINE=1 with a CVE id'; "
             "else for f in $hits; do echo \"=== $f ===\"; "
             "grep -v -E '^!\\[|^[[:space:]]*$' \"$f\" 2>/dev/null | sed -n '1,8p'; "
             "echo; done; fi",
-            cve_id, cve_id, topic, kw, kw, kw);
+            cve_id, cve_id, topic);
         return 0;  /* cyber specialism */
     }
 
@@ -1612,6 +1703,10 @@ static int build_command(const char *task, char *cmd, size_t cmdsz) {
     }
 
     if (kind == 1) { /* coding: actually write, compile and run a C snippet */
+        if (plan_only) {     /* describe it; create nothing on disk */
+            snprintf(cmd, cmdsz, "gcc snippet.c -o snippet && ./snippet   (in a private temp dir)");
+            return kind;
+        }
         /* Unique 0700 dir avoids the /tmp symlink-race of a fixed path. */
         char dir[64] = "/tmp/sentinel_agent_XXXXXX";
         char src[96], bin[96];
@@ -1637,14 +1732,13 @@ static int build_command(const char *task, char *cmd, size_t cmdsz) {
                     fp);
             }
             fclose(fp);
-            /* note: 'rm -f' (not 'rm -rf') so the safety guard doesn't flag it */
             snprintf(cmd, cmdsz,
-                "gcc %s -o %s 2>&1 && echo '[coding agent] compiled OK, running:' && %s; "
-                "rm -f %s %s; rmdir %s 2>/dev/null",
-                src, bin, bin, src, bin, dir);
+                "gcc %s -o %s 2>&1 && echo '[coding agent] compiled OK, running:' && %s",
+                src, bin, bin);
         } else {
             snprintf(cmd, cmdsz, "echo '[coding agent] could not write snippet'");
         }
+        snprintf(tmpdir, tmpsz, "%s", dir);   /* caller removes it (cleanup_tmpdir) */
         return kind;
     }
 
@@ -1691,13 +1785,109 @@ static int estimate_difficulty(const char *task) {
     return 0;
 }
 
+/* The safety guard. The command that would run is always checked. The task
+ * text is checked too, so "TASK: sudo rm -rf /" is refused outright — except
+ * for corpus lookups, where the text is only a search query and never reaches
+ * a shell: asking about a CVE in sudo or pkexec must work. */
+static int task_allowed(const char *task, const char *cmd) {
+    if (!is_command_safe(cmd)) return 0;
+    return g_cmd_is_lookup || is_command_safe(task);
+}
+
+/* Remove the coding agent's private temp dir (snippet.c, snippet, the dir). */
+static void cleanup_tmpdir(const char *dir) {
+    if (!dir || !dir[0]) return;
+    char path[128];
+    snprintf(path, sizeof path, "%s/snippet.c", dir); unlink(path);
+    snprintf(path, sizeof path, "%s/snippet", dir);   unlink(path);
+    rmdir(dir);
+}
+
+static double now_seconds(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
+}
+
+/* Run `cmd` under /bin/sh with a hard wall-clock cap, handing its stdout to
+ * `emit` as it arrives. The command runs in its own process group, so when
+ * the cap hits, everything it started is killed too. It runs exactly once.
+ * Returns the exit status, 124 if the cap was hit, -1 if it couldn't start. */
+typedef void (*emit_fn)(void *ctx, const char *buf, size_t n);
+static int run_capped(const char *cmd, int secs, emit_fn emit, void *ctx) {
+    int fd[2];
+    if (pipe(fd) < 0) return -1;
+    fflush(stdout);
+    pid_t pid = fork();
+    if (pid < 0) { close(fd[0]); close(fd[1]); return -1; }
+    if (pid == 0) {
+        setpgid(0, 0);
+        signal(SIGPIPE, SIG_DFL);
+        signal(SIGINT, SIG_DFL);
+        dup2(fd[1], STDOUT_FILENO);
+        close(fd[0]); close(fd[1]);
+        execl("/bin/sh", "sh", "-c", cmd, (char *)NULL);
+        _exit(127);
+    }
+    setpgid(pid, pid);          /* also set here, so the kill below can't race the child */
+    close(fd[1]);
+
+    double deadline = now_seconds() + secs;
+    int timed_out = 0, status = 0, reaped = 0;
+    char buf[4096];
+    for (;;) {                                  /* stream output until EOF or the cap */
+        double left = deadline - now_seconds();
+        if (left <= 0) { timed_out = 1; break; }
+        struct pollfd pf = { fd[0], POLLIN, 0 };
+        int r = poll(&pf, 1, (int)(left * 1000) + 1);
+        if (r < 0) { if (errno == EINTR) continue; break; }
+        if (r == 0) { timed_out = 1; break; }
+        ssize_t n = read(fd[0], buf, sizeof buf);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) break;
+        emit(ctx, buf, (size_t)n);
+    }
+    close(fd[0]);
+    while (!timed_out && !reaped) {             /* output closed; wait for exit, still capped */
+        pid_t w = waitpid(pid, &status, WNOHANG);
+        if (w == pid || (w < 0 && errno != EINTR)) { reaped = 1; break; }
+        if (now_seconds() >= deadline) timed_out = 1;
+        else usleep(10000);
+    }
+    if (timed_out) kill(-pid, SIGKILL);
+    if (!reaped) while (waitpid(pid, &status, 0) < 0 && errno == EINTR) { }
+    if (timed_out) return 124;
+    if (WIFEXITED(status)) return WEXITSTATUS(status);
+    return WIFSIGNALED(status) ? 128 + WTERMSIG(status) : -1;
+}
+
+/* emit target for run_agent: print each line behind the box-drawing gutter,
+ * or (terse) just remember the first line. */
+typedef struct { int terse, at_bol; char first[512]; size_t fl; int first_done; } AgentOut;
+static void agent_emit(void *ctx, const char *buf, size_t n) {
+    AgentOut *o = ctx;
+    for (size_t i = 0; i < n; i++) {
+        char ch = buf[i];
+        if (o->terse) {
+            if (o->first_done) return;
+            if (ch == '\n') o->first_done = 1;
+            else if (o->fl + 1 < sizeof o->first) o->first[o->fl++] = ch;
+            continue;
+        }
+        if (o->at_bol) { fputs("  │  ", stdout); o->at_bol = 0; }
+        putchar(ch);
+        if (ch == '\n') o->at_bol = 1;
+    }
+}
+
 /* Runs as the spawned sub-agent at a given difficulty tier. */
 static int run_agent(int tier, const char *task) {
     if (tier < 0 || tier > 2) tier = 1;
     int terse = getenv("SLM_AGENT_TERSE") != NULL;   /* compact output for big fan-outs */
+    int plan_only = getenv("SLM_NO_EXEC") != NULL;
     const char *kinds[] = { "CYBERSECURITY", "CODING", "GENERAL" };
-    char cmd[2048];
-    int kind = build_command(task, cmd, sizeof cmd);
+    char cmd[2048], tmpdir[64];
+    int kind = build_command(task, cmd, sizeof cmd, tmpdir, sizeof tmpdir, plan_only);
     if (kind < 0 || kind > 2) kind = 2;
 
     if (!terse) {
@@ -1708,44 +1898,32 @@ static int run_agent(int tier, const char *task) {
         printf("  │  task: %s\n", task);
     }
 
-    if (getenv("SLM_NO_EXEC")) {
+    if (plan_only) {
         if (terse) printf("  · agent pid=%d tier=%s PLAN-ONLY\n", (int)getpid(), TIER_NAME[tier]);
         else printf("  │  [plan-only mode: SLM_NO_EXEC set]\n  └─ would run: %s\n", cmd);
         return 0;
     }
-    if (!is_command_safe(task) || !is_command_safe(cmd)) {
+    if (!task_allowed(task, cmd)) {
+        cleanup_tmpdir(tmpdir);
         if (terse) printf("  · agent pid=%d tier=%s REFUSED (unsafe)\n", (int)getpid(), TIER_NAME[tier]);
         else printf("  │  REFUSED by safety guard (sudo/destructive pattern).\n  └─ no action.\n");
         return 2;
     }
 
-    /* difficulty-scaled compute cap via coreutils `timeout` (if present);
-     * the validated command is passed through the environment to avoid any
-     * shell-quoting issues. */
-    setenv("SLM_AGENT_CMD", cmd, 1);
-    char wrapped[160];
-    snprintf(wrapped, sizeof wrapped,
-        "command -v timeout >/dev/null && timeout %d sh -c 'eval \"$SLM_AGENT_CMD\"' "
-        "|| sh -c 'eval \"$SLM_AGENT_CMD\"'", TIER_TIMEOUT[tier]);
-
     if (!terse) { printf("  │  exec: %s\n  │  ----- output -----\n", cmd); fflush(stdout); }
 
-    FILE *pp = popen(wrapped, "r");
-    if (!pp) { printf("  · agent pid=%d failed to launch shell\n", (int)getpid()); return 1; }
-    char line[512];
-    char first[512]; first[0] = '\0';
-    while (fgets(line, sizeof line, pp)) {
-        if (terse) { if (!first[0]) snprintf(first, sizeof first, "%s", line); }
-        else printf("  │  %s", line);
-    }
-    int rc = pclose(pp);
-    int code = (rc == -1) ? -1 : WEXITSTATUS(rc);
+    AgentOut ao; memset(&ao, 0, sizeof ao);
+    ao.terse = terse; ao.at_bol = 1;
+    int code = run_capped(cmd, TIER_TIMEOUT[tier], agent_emit, &ao);   /* difficulty-scaled cap */
+    cleanup_tmpdir(tmpdir);
+    if (code == -1) { printf("  · agent pid=%d failed to launch shell\n", (int)getpid()); return 1; }
     if (terse) {
-        size_t fl = strlen(first); if (fl && first[fl-1] == '\n') first[fl-1] = '\0';
-        printf("  · agent pid=%d tier=%s %s%s(exit %d)\n", (int)getpid(),
+        ao.first[ao.fl] = '\0';
+        printf("  · agent pid=%d tier=%s %s%s%s(exit %d)\n", (int)getpid(),
                TIER_NAME[tier], code == 124 ? "[budget-capped] " : "",
-               first[0] ? first : "", code);
+               ao.first, ao.fl ? " " : "", code);
     } else {
+        if (!ao.at_bol) putchar('\n');
         if (code == 124) printf("  │  [compute budget exceeded — stopped at %ds cap]\n",
                                  TIER_TIMEOUT[tier]);
         printf("  └─ sub-agent pid=%d finished (exit %d)\n", (int)getpid(), code);
@@ -1780,6 +1958,7 @@ static int spawn_batch(const char *selfexe, const char *task, int count, int tie
         if (pid == 0) {
             char ts[8]; snprintf(ts, sizeof ts, "%d", tier);
             execl(selfexe, selfexe, "--agent", ts, task, (char *)NULL);
+            perror("execl");
             _exit(127);
         }
         pids[launched++] = pid;
@@ -1789,38 +1968,51 @@ static int spawn_batch(const char *selfexe, const char *task, int count, int tie
     return launched;
 }
 
+/* Bounded string builder for captured agent output: never writes past the
+ * buffer, and says so when output had to be dropped. */
+typedef struct { char *buf; size_t len, cap; int truncated; } OutBuf;
+static void outbuf_add(void *ctx, const char *data, size_t n) {
+    OutBuf *o = ctx;
+    size_t room = o->cap - 1 - o->len;
+    if (n > room) { n = room; o->truncated = 1; }
+    memcpy(o->buf + o->len, data, n);
+    o->len += n;
+    o->buf[o->len] = '\0';
+}
+static void outbuf_str(OutBuf *o, const char *str) { outbuf_add(o, str, strlen(str)); }
+
 /* Run a task and capture the agent output into `out` (for the GUI/TUI).
- * Honors the safety guard and SLM_NO_EXEC. Returns bytes written. */
+ * Honors the safety guard and SLM_NO_EXEC. Returns bytes written (< outsz). */
 static size_t run_task_capture(const char *task, char *out, size_t outsz) {
+    static const char trunc_note[] = "\n[output truncated]\n";
+    OutBuf o = { out, 0, outsz - sizeof trunc_note, 0 };   /* keep room for the note */
+    out[0] = '\0';
     int tier = estimate_difficulty(task);
-    char cmd[2048];
-    int kind = build_command(task, cmd, sizeof cmd);
+    int plan_only = getenv("SLM_NO_EXEC") != NULL;
+    char cmd[2048], tmpdir[64], head[96];
+    int kind = build_command(task, cmd, sizeof cmd, tmpdir, sizeof tmpdir, plan_only);
     if (kind < 0 || kind > 2) kind = 2;
     const char *kn[] = { "cybersecurity", "coding", "general" };
-    size_t off = 0;
-    off += snprintf(out + off, outsz - off,
-                    "[%s agent · tier %s]\n", kn[kind], TIER_NAME[tier]);
-    if (!is_command_safe(task) || !is_command_safe(cmd)) {
-        off += snprintf(out + off, outsz - off,
-                        "REFUSED by safety guard (sudo/destructive pattern).\n");
-        return off;
+    snprintf(head, sizeof head, "[%s agent · tier %s]\n", kn[kind], TIER_NAME[tier]);
+    outbuf_str(&o, head);
+    if (plan_only) {
+        outbuf_str(&o, "[plan-only] would run:\n");
+        outbuf_str(&o, cmd);
+        outbuf_str(&o, "\n");
+    } else if (!task_allowed(task, cmd)) {
+        outbuf_str(&o, "REFUSED by safety guard (sudo/destructive pattern).\n");
+    } else {
+        int code = run_capped(cmd, TIER_TIMEOUT[tier], outbuf_add, &o);
+        if (code == -1) outbuf_str(&o, "failed to launch shell\n");
+        else if (code == 124) {
+            snprintf(head, sizeof head, "[compute budget exceeded — stopped at %ds cap]\n",
+                     TIER_TIMEOUT[tier]);
+            outbuf_str(&o, head);
+        }
     }
-    if (getenv("SLM_NO_EXEC")) {
-        off += snprintf(out + off, outsz - off, "[plan-only] would run:\n%s\n", cmd);
-        return off;
-    }
-    setenv("SLM_AGENT_CMD", cmd, 1);
-    char wrapped[160];
-    snprintf(wrapped, sizeof wrapped,
-        "command -v timeout >/dev/null && timeout %d sh -c 'eval \"$SLM_AGENT_CMD\"' "
-        "|| sh -c 'eval \"$SLM_AGENT_CMD\"'", TIER_TIMEOUT[tier]);
-    FILE *pp = popen(wrapped, "r");
-    if (!pp) { off += snprintf(out + off, outsz - off, "failed to launch shell\n"); return off; }
-    char line[512];
-    while (off < outsz - 1 && fgets(line, sizeof line, pp))
-        off += snprintf(out + off, outsz - off, "%s", line);
-    pclose(pp);
-    return off;
+    cleanup_tmpdir(tmpdir);
+    if (o.truncated) { o.cap = outsz; outbuf_str(&o, trunc_note); }
+    return o.len;
 }
 
 /* ================================================================== */
@@ -1851,26 +2043,70 @@ static const char *GUI_HTML =
 "function add(c,t){var s=document.createElement('span');s.className=c;s.textContent=t;L.appendChild(s);L.scrollTop=L.scrollHeight;}"
 "async function send(){var q=document.getElementById('q');var t=q.value.trim();if(!t)return;q.value='';"
 "add('u','\\u25b8 '+t+'\\n');add('s','running...\\n');"
-"try{var r=await fetch('/api',{method:'POST',body:t});var x=await r.text();"
+"try{var r=await fetch('/api',{method:'POST',headers:{'X-Sentinel':'1'},body:t});var x=await r.text();"
 "L.lastChild.remove();add('a',x+'\\n\\n');}catch(e){L.lastChild.remove();add('s','error: '+e+'\\n');}}"
 "</script></body></html>";
 
 static volatile sig_atomic_t g_serve_stop = 0;
 static void on_sigint(int s) { (void)s; g_serve_stop = 1; }
 
+#ifndef MSG_NOSIGNAL
+#define MSG_NOSIGNAL 0          /* macOS: SO_NOSIGPIPE is set on the socket instead */
+#endif
+
 static void http_send(int c, const char *status, const char *ctype, const char *body, size_t blen) {
     char hdr[256];
     int hl = snprintf(hdr, sizeof hdr,
         "HTTP/1.0 %s\r\nContent-Type: %s\r\nContent-Length: %zu\r\n"
-        "Connection: close\r\n\r\n", status, ctype, blen);
-    if (write(c, hdr, hl) < 0) return;
+        "X-Content-Type-Options: nosniff\r\nConnection: close\r\n\r\n", status, ctype, blen);
+    if (send(c, hdr, (size_t)hl, MSG_NOSIGNAL) < 0) return;
     size_t off = 0;
-    while (off < blen) { ssize_t w = write(c, body + off, blen - off); if (w <= 0) break; off += w; }
+    while (off < blen) {
+        ssize_t w = send(c, body + off, blen - off, MSG_NOSIGNAL);
+        if (w <= 0) break;
+        off += (size_t)w;
+    }
+}
+static void http_error(int c, const char *status) {
+    http_send(c, status, "text/plain; charset=utf-8", status, strlen(status));
+}
+
+/* Copy the value of header `name` (e.g. "host") into out; 0 if absent. */
+static int http_header(const char *req, const char *hdr_end, const char *name,
+                       char *out, size_t outsz) {
+    size_t nl = strlen(name);
+    for (const char *p = strstr(req, "\r\n"); p && p < hdr_end; p = strstr(p, "\r\n")) {
+        p += 2;
+        if (strncasecmp(p, name, nl) == 0 && p[nl] == ':') {
+            p += nl + 1;
+            while (*p == ' ' || *p == '\t') p++;
+            size_t o = 0;
+            while (*p && *p != '\r' && *p != '\n' && o + 1 < outsz) out[o++] = *p++;
+            while (o && (out[o-1] == ' ' || out[o-1] == '\t')) o--;
+            out[o] = '\0';
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* Is `v` this server's own address ("127.0.0.1:port" or "localhost:port"),
+ * optionally behind `scheme` ("http://")? Anything else is a foreign site
+ * (or a DNS-rebinding attempt) and must not reach the agent. */
+static int http_is_self(const char *v, const char *scheme, int port) {
+    char want[64];
+    static const char *hosts[] = { "127.0.0.1", "localhost", NULL };
+    for (int i = 0; hosts[i]; i++) {
+        snprintf(want, sizeof want, "%s%s:%d", scheme, hosts[i], port);
+        if (strcasecmp(v, want) == 0) return 1;
+    }
+    return 0;
 }
 
 static int serve_http(int port) {
-    signal(SIGINT, on_sigint);
-    signal(SIGPIPE, SIG_IGN);
+    struct sigaction sa; memset(&sa, 0, sizeof sa);
+    sa.sa_handler = on_sigint;                    /* no SA_RESTART: Ctrl-C interrupts accept() */
+    sigaction(SIGINT, &sa, NULL);
     int s = socket(AF_INET, SOCK_STREAM, 0);
     if (s < 0) { perror("socket"); return 1; }
     int one = 1; setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
@@ -1887,16 +2123,53 @@ static int serve_http(int port) {
     while (!g_serve_stop) {
         int c = accept(s, NULL, NULL);
         if (c < 0) { if (g_serve_stop) break; continue; }
-        ssize_t n = read(c, req, sizeof req - 1);
-        if (n <= 0) { close(c); continue; }
-        req[n] = '\0';
-        if (strncmp(req, "POST /api", 9) == 0) {
-            char *body = strstr(req, "\r\n\r\n");
-            body = body ? body + 4 : (char *)"";
-            size_t blen = run_task_capture(body, out, sizeof out);
-            http_send(c, "200 OK", "text/plain; charset=utf-8", out, blen);
-        } else {
+        struct timeval tv = { 5, 0 };             /* a silent client can't hang the server */
+        setsockopt(c, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+        setsockopt(c, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
+#ifdef SO_NOSIGPIPE
+        setsockopt(c, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof one);
+#endif
+        /* Read the whole request: headers, then Content-Length bytes of body. */
+        size_t n = 0, need = 0;
+        char *hdr_end = NULL;
+        const char *err = NULL;
+        for (;;) {
+            if (n >= sizeof req - 1) { err = "413 Payload Too Large"; break; }
+            ssize_t r = recv(c, req + n, sizeof req - 1 - n, 0);
+            if (r < 0 && errno == EINTR && !g_serve_stop) continue;
+            if (r <= 0) { err = n ? "408 Request Timeout" : ""; break; }
+            n += (size_t)r;
+            req[n] = '\0';
+            if (!hdr_end && (hdr_end = strstr(req, "\r\n\r\n")) != NULL) {
+                char cl[32];
+                long len = http_header(req, hdr_end, "content-length", cl, sizeof cl) ? atol(cl) : 0;
+                size_t hl = (size_t)(hdr_end + 4 - req);
+                if (len < 0 || (size_t)len > sizeof req - 1 - hl) { err = "413 Payload Too Large"; break; }
+                need = hl + (size_t)len;
+            }
+            if (hdr_end && n >= need) break;
+        }
+        if (err) { if (*err) http_error(c, err); close(c); continue; }
+        req[need] = '\0';
+
+        char host[128] = "", origin[160] = "", marker[8] = "";
+        int has_origin = http_header(req, hdr_end, "origin", origin, sizeof origin);
+        if (!http_header(req, hdr_end, "host", host, sizeof host) ||
+            !http_is_self(host, "", port) ||
+            (has_origin && !http_is_self(origin, "http://", port))) {
+            http_error(c, "403 Forbidden");       /* another site, or DNS rebinding */
+        } else if (strncmp(req, "POST /api ", 10) == 0) {
+            /* The page sends X-Sentinel; a cross-site form or fetch can't. */
+            if (!http_header(req, hdr_end, "x-sentinel", marker, sizeof marker)) {
+                http_error(c, "403 Forbidden");
+            } else {
+                size_t blen = run_task_capture(hdr_end + 4, out, sizeof out);
+                http_send(c, "200 OK", "text/plain; charset=utf-8", out, blen);
+            }
+        } else if (strncmp(req, "GET / ", 6) == 0) {
             http_send(c, "200 OK", "text/html; charset=utf-8", GUI_HTML, strlen(GUI_HTML));
+        } else {
+            http_error(c, "404 Not Found");
         }
         close(c);
     }
@@ -1908,6 +2181,14 @@ static int serve_http(int port) {
 /* ================================================================== */
 /*  TUI — an ANSI-styled interactive terminal interface (no ncurses).  */
 /* ================================================================== */
+/* fgets filled the buffer without reaching the newline: discard the rest of
+ * that input line, so its tail isn't read back as a separate command. */
+static void drain_long_line(const char *line, size_t len) {
+    if (len == 0 || line[len - 1] == '\n') return;
+    int ch;
+    while ((ch = getchar()) != EOF && ch != '\n') { }
+}
+
 static void run_tui(const char *selfexe, int params) {
     printf("\033[2J\033[H");                       /* clear screen, home */
     printf("\033[36m");
@@ -1925,6 +2206,7 @@ static void run_tui(const char *selfexe, int params) {
         fflush(stdout);
         if (!fgets(line, sizeof line, stdin)) break;
         size_t len = strlen(line);
+        drain_long_line(line, len);
         while (len && (line[len-1] == '\n' || line[len-1] == '\r')) line[--len] = '\0';
         if (len == 0) continue;
         if (strcmp(line, "/quit") == 0 || strcmp(line, "/exit") == 0) break;
@@ -1943,13 +2225,17 @@ static void run_tui(const char *selfexe, int params) {
             int count = atoi(p);
             while (*p && *p != ' ') p++;
             while (*p == ' ') p++;
+            if (count < 1) count = 1;
+            if (count > MAX_AGENTS) count = MAX_AGENTS;
             int tier = estimate_difficulty(p);
             printf("  \033[36mfan-out %d agents (tier %s)\033[0m\n", count, TIER_NAME[tier]);
+            fflush(stdout);
             spawned += spawn_batch(selfexe, p, count, tier);
         } else {
             char *task = trig ? trig + 5 : line; while (*task == ' ') task++;
             int tier = estimate_difficulty(task);
             printf("  \033[36m▸ %s  \033[90m(tier %s)\033[0m\n", task, TIER_NAME[tier]);
+            fflush(stdout);
             spawn_agent_tier(selfexe, task, tier);
             spawned++;
             (void)cve;
@@ -2026,7 +2312,8 @@ static void corpus_append_dir(Corpus *c, const char *dir, int depth) {
         if (e->d_name[0] == '.') continue;          /* skip . .. and dotfiles (.git) */
         snprintf(path, sizeof path, "%s/%s", dir, e->d_name);
         struct stat st;
-        if (stat(path, &st) != 0) continue;
+        if (lstat(path, &st) != 0) continue;        /* lstat: symlinks are skipped, so a
+                                                     * link back up the tree can't loop */
         if (S_ISDIR(st.st_mode))      corpus_append_dir(c, path, depth + 1);
         else if (S_ISREG(st.st_mode) && has_text_ext(e->d_name))
                                        corpus_append_file(c, path);
@@ -2152,6 +2439,26 @@ int main(int argc, char **argv) {
         return 0;
     }
 
+    /* ---- refuse unknown or incomplete options: they must never fall through
+     * to the default mode, which trains and rewrites the checkpoint ---- */
+    if (argc >= 2 && argv[1][0] == '-') {
+        static const struct { const char *name; int min_args; } opts[] = {
+            { "--train", 1 }, { "--agent", 1 }, { "--tui", 0 }, { "--serve", 0 },
+            { "--quantize", 1 }, { "--sample-quant", 1 }, { "--quantize-train", 1 },
+            { "--ask-opus", 1 }, { "--self-study", 0 }, { "--generate", 0 },
+            { "--gradcheck", 0 }, { NULL, 0 } };
+        int i = 0;
+        while (opts[i].name && strcmp(argv[1], opts[i].name) != 0) i++;
+        if (!opts[i].name) {
+            fprintf(stderr, "%s: unknown option '%s' (try --help)\n", argv[0], argv[1]);
+            return 2;
+        }
+        if (argc - 2 < opts[i].min_args) {
+            fprintf(stderr, "%s: %s needs an argument (try --help)\n", argv[0], argv[1]);
+            return 2;
+        }
+    }
+
     /* ---- optional online advisor: ask Claude Opus one question (opt-in) ---- */
     if (argc >= 3 && strcmp(argv[1], "--ask-opus") == 0) {
         static char ans[1 << 16];
@@ -2170,8 +2477,18 @@ int main(int argc, char **argv) {
         return run_agent(1, argv[2]);
 
     /* ---- GUI / TUI agent consoles (don't allocate the big LM weights) ---- */
-    if (argc >= 2 && strcmp(argv[1], "--serve") == 0)
-        return serve_http(argc >= 3 ? atoi(argv[2]) : 8080);
+    if (argc >= 2 && strcmp(argv[1], "--serve") == 0) {
+        long port = 8080;
+        if (argc >= 3) {
+            char *end;
+            port = strtol(argv[2], &end, 10);
+            if (*end || port < 1 || port > 65535) {
+                fprintf(stderr, "%s: --serve needs a port from 1 to 65535, got '%s'\n", argv[0], argv[2]);
+                return 2;
+            }
+        }
+        return serve_http((int)port);
+    }
     if (argc >= 2 && strcmp(argv[1], "--tui") == 0) {
         char selfexe[PATH_MAX]; self_path(selfexe, sizeof selfexe, argv[0]);
         int params = (int)(VOCAB*EMBED + NUM_LAYERS*NGATE*(2*HIDDEN*HIDDEN + HIDDEN)
@@ -2190,7 +2507,9 @@ int main(int argc, char **argv) {
         int qmode = (strcmp(argv[2], "1bit") == 0 || strcmp(argv[2], "1") == 0) ? 1 : 8;
         const char *out = (argc >= 4) ? argv[3]
                         : (qmode == 1 ? "sentinel-1bit.bin" : "sentinel-int8.bin");
-        if (load_model(CKPT_PATH))
+        int lm = load_model(CKPT_PATH);
+        if (lm < 0) return 1;                   /* there is a checkpoint, but not for this build */
+        if (lm)
             printf("Loaded float checkpoint '%s'.\n", CKPT_PATH);
         else
             printf("No float checkpoint '%s' — quantizing current (untrained) weights.\n",
@@ -2226,7 +2545,9 @@ int main(int argc, char **argv) {
 
     /* ---- pure inference: generate n chars from the checkpoint, no training ---- */
     if (argc >= 2 && strcmp(argv[1], "--generate") == 0) {
-        if (!load_model(CKPT_PATH))
+        int lm = load_model(CKPT_PATH);
+        if (lm < 0) return 1;
+        if (!lm)
             fprintf(stderr, "no checkpoint '%s' — generating from untrained weights\n", CKPT_PATH);
         int n = (argc >= 3) ? atoi(argv[2]) : 400;
         if (n <= 0) n = 400;
@@ -2236,12 +2557,18 @@ int main(int argc, char **argv) {
     }
 
     int loaded = load_model(CKPT_PATH);
+    if (loaded < 0) {
+        fprintf(stderr, "Refusing to train: that would overwrite '%s' with a new model.\n"
+                "Rebuild with the settings it was trained with, or move the file away first.\n",
+                CKPT_PATH);
+        return 1;
+    }
     if (loaded) printf("Loaded checkpoint '%s' — continuing to learn.\n", CKPT_PATH);
     else        printf("No checkpoint — starting from fixed static weights.\n");
 
     int iters = 2000;
     const char *env_ep = getenv("SLM_EPOCHS");
-    if (env_ep) { int v = atoi(env_ep); if (v > 0) iters = v; }
+    if (env_ep) { int v = atoi(env_ep); if (v > 0 || strcmp(env_ep, "0") == 0) iters = v; }   /* 0 = no warm-up */
     const char *env_lr = getenv("SLM_LR");
     if (env_lr) { double v = atof(env_lr); if (v > 0.0) g_lr = v; }
     const char *env_wd = getenv("SLM_WD");
@@ -2304,7 +2631,7 @@ int main(int argc, char **argv) {
                c.files, c.len, iters);
         train(c.buf, (int)c.len, iters, 1);
         free(c.buf);
-        save_model(CKPT_PATH);
+        if (!save_model(CKPT_PATH)) return 1;
         printf("Checkpoint saved to '%s'.\n", CKPT_PATH);
         return 0;
     }
@@ -2322,8 +2649,11 @@ int main(int argc, char **argv) {
     sample('t', 180);
     printf("\"\n");
 
-    save_model(CKPT_PATH);
-    printf("Checkpoint saved to '%s'.\n", CKPT_PATH);
+    int dirty = iters > 0;      /* weights changed since the checkpoint was loaded/saved? */
+    if (dirty && save_model(CKPT_PATH)) {
+        printf("Checkpoint saved to '%s'.\n", CKPT_PATH);
+        dirty = 0;
+    }
 
     /* ---- serve loop: read stdin, online-learn, spawn agents on TASK: ---- */
     char selfexe[PATH_MAX];
@@ -2341,6 +2671,7 @@ int main(int argc, char **argv) {
 
     while (fgets(line, sizeof line, stdin)) {
         size_t len = strlen(line);
+        drain_long_line(line, len);
         while (len && (line[len - 1] == '\n' || line[len - 1] == '\r'))
             line[--len] = '\0';
         if (len == 0) continue;
@@ -2392,6 +2723,7 @@ int main(int argc, char **argv) {
                     }
                     train_step(inp, tgt, hprev);
                 }
+                dirty = 1;
                 printf("[online-learn] absorbed %zu chars into the network.\n", len);
             } else {
                 printf("[input too short to train on: \"%s\"]\n", line);
@@ -2400,9 +2732,9 @@ int main(int argc, char **argv) {
         fflush(stdout);
     }
 
-    save_model(CKPT_PATH);
+    int saved = dirty ? save_model(CKPT_PATH) : 1;   /* nothing learned -> nothing to rewrite */
     printf("\n=== session over ===\n");
     printf("sub-agents spawned this session: %d\n", spawned);
-    printf("checkpoint persisted to '%s' (skills retained for next run).\n", CKPT_PATH);
-    return 0;
+    if (saved && dirty) printf("checkpoint persisted to '%s' (skills retained for next run).\n", CKPT_PATH);
+    return saved ? 0 : 1;
 }

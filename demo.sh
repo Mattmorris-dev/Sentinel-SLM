@@ -7,7 +7,7 @@
 #   ./demo.sh
 #
 set -uo pipefail
-cd "$(dirname "$0")"
+cd "$(dirname "$0")" || exit 1
 
 B='\033[36m'; G='\033[32m'; D='\033[90m'; R='\033[0m'
 say() { printf "${B}── %s${R}\n" "$*"; }
@@ -15,7 +15,14 @@ say() { printf "${B}── %s${R}\n" "$*"; }
 command -v gcc >/dev/null || { echo "need gcc"; exit 1; }
 
 say "building the tiny SLM (~1.2M params, builds in a second)"
-[ -x ./sentinel-slm ] || gcc -O2 -Wall -DHIDDEN=256 -DEMBED=64 -DNUM_LAYERS=2 \
+# LayerNorm is the default build (as in the Makefile). A checkpoint trained by
+# an older, plain-GRU build ("SLM3" tag) keeps its matching binary instead.
+ln_flag() {
+  if [ -f "$1" ] && [ "$(od -An -tu4 -N4 "$1" 2>/dev/null | tr -d ' ')" = 1397509427 ]; then echo ""
+  else echo "-DUSE_LN"; fi
+}
+# shellcheck disable=SC2046
+[ -x ./sentinel-slm ] || gcc -O2 -Wall $(ln_flag sentinel-slm.bin) -DHIDDEN=256 -DEMBED=64 -DNUM_LAYERS=2 \
     -DCKPT_PATH='"sentinel-slm.bin"' -o sentinel-slm main.c -lm -pthread
 
 if [ ! -d corpus ]; then

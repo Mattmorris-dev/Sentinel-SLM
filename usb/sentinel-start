@@ -18,6 +18,7 @@
 # Env: SENTINEL_MODEL=<name> forces a model; SENTINEL_HOME (data dir),
 #      SENTINEL_PORT (GUI port, 8080), SENTINEL_OPT (install dir, /opt/sentinel).
 set -uo pipefail
+SELF="$(readlink -f "$0" 2>/dev/null || echo "$0")"   # we cd below; keep a usable path
 
 OPT="${SENTINEL_OPT:-/opt/sentinel}"
 DATA="${SENTINEL_HOME:-$HOME/.local/share/sentinel}"
@@ -30,7 +31,11 @@ log() { echo "sentinel-start: $*" >&2; }
 mkdir -p "$DATA/bin" || { log "cannot create $DATA"; exit 1; }
 cd "$DATA" || exit 1
 
-# --- import trained checkpoints (image, USB data partition, or SENTINEL_MODELS) once
+# --- import trained checkpoints (image, USB data partition, or SENTINEL_MODELS).
+#     They are LINKED, not copied: no second multi-GB copy on the stick, and the
+#     shipped file stays pristine. The first time the model learns, it saves a
+#     real file here in place of the link. Links are refreshed on every start,
+#     because the stick's device name differs from one PC to the next.
 import_models() {
     local d f name
     for d in "$OPT/models" /run/live/persistence/*/sentinel-models ${SENTINEL_MODELS:-}; do
@@ -38,37 +43,45 @@ import_models() {
         for f in "$d"/*.bin; do
             [ -f "$f" ] || continue
             name="$(basename "$f" .bin | tr -c 'A-Za-z0-9_.\n-' '_')"
-            if [ ! -e "trained-$name.bin" ]; then
-                cp "$f" "trained-$name.bin" && log "imported trained model '$name' from $d"
+            if [ -L "trained-$name.bin" ] || [ ! -e "trained-$name.bin" ]; then
+                [ -e "trained-$name.bin" ] || log "found trained model '$name' in $d"
+                ln -sfn "$f" "trained-$name.bin"
             fi
         done
+    done
+    for f in trained-*.bin; do      # a link whose source is gone (stick layout changed)
+        if [ -L "$f" ] && [ ! -e "$f" ]; then rm -f "$f"; fi
     done
 }
 
 # --- link a corpus for retrieval/training if one shipped
 link_corpus() {
+    if [ -L corpus ] && [ ! -e corpus ]; then rm -f corpus; fi   # stale link from another PC
     [ -e corpus ] && return 0
     local d
     for d in "$OPT/corpus" /run/live/persistence/*/sentinel-corpus; do
-        if [ -d "$d" ]; then ln -s "$d" corpus && log "using corpus at $d"; return 0; fi
+        if [ -d "$d" ]; then ln -sfn "$d" corpus && log "using corpus at $d"; return 0; fi
     done
 }
 
-# --- read a checkpoint header: "magic vocab embed hidden layers"
-hdr() { od -An -tu4 -N20 "$1" 2>/dev/null | tr -s ' ' | sed 's/^ //'; }
+# --- read a checkpoint header: "magic vocab embed hidden layers" (one line)
+hdr() { od -An -v -tu4 -N20 "$1" 2>/dev/null | tr -s ' \n' ' ' | sed 's/^ //'; }
 
 # --- build (or reuse) a binary that matches a trained checkpoint.
 #     Prints "name|binary|train_ram_mb" on success.
 build_for() {
     local f="$1" name m v e h l cflags p ram bin
     name="${f#trained-}"; name="${name%.bin}"
-    read -r m v e h l <<<"$(hdr "$f")"
+    m=""; v=""; e=""; h=""; l=""
+    read -r m v e h l _ <<<"$(hdr "$f")"
     case "$m" in
         "$MAGIC_SLM3") cflags="" ;;
         "$MAGIC_SLM4") cflags="-DUSE_LN" ;;
         *) log "skipping $f (not a Sentinel training checkpoint)"; return 1 ;;
     esac
-    case "$v$e$h$l" in *[!0-9]*|'') return 1 ;; esac
+    for p in "$v" "$e" "$h" "$l"; do
+        case "$p" in *[!0-9]*|'') log "skipping $f (unreadable header)"; return 1 ;; esac
+    done
     p=$(( v*e + l*3*(2*h*h + h) + v*h + v ))
     ram=$(( p * 32 / 1000000 ))
     [ $(( p * 32 )) -gt 1900000000 ] && cflags="$cflags -mcmodel=large"
@@ -79,11 +92,13 @@ build_for() {
         gcc -O2 $cflags -DVOCAB="$v" -DEMBED="$e" -DHIDDEN="$h" -DNUM_LAYERS="$l" \
             -DCKPT_PATH="\"$f\"" -o "$bin" "$OPT/src/main.c" -lm -pthread || { log "build failed for $f"; return 1; }
     fi
-    echo "trained-$name|$bin|$ram"
+    echo "trained-$name|$bin|$ram|$f"
 }
 
 # --- choose the model
-mem_mb=$(( $(awk '/^MemTotal:/{print $2}' "$MEMINFO") / 1024 ))
+mem_kb="$(awk '/^MemTotal:/{print $2}' "$MEMINFO" 2>/dev/null)"
+case "$mem_kb" in ''|*[!0-9]*) log "cannot read RAM size from $MEMINFO — assuming 2 GB"; mem_kb=2097152 ;; esac
+mem_mb=$(( mem_kb / 1024 ))
 if [ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ] || command -v startxfce4 >/dev/null 2>&1; then
     reserve=1500    # leave room for the desktop + browser
 else
@@ -91,38 +106,55 @@ else
 fi
 usable=$(( mem_mb - reserve ))
 
-PICK_NAME=""; PICK_BIN=""; PICK_RAM=0; PICK_WHY=""
-consider() {   # name bin ram why
-    local n="$1" b="$2" r="$3" why="$4"
+# Is the data dir backed by RAM (a live boot with no persistence partition)?
+# Then a saved checkpoint (~3/4 of the training RAM) also has to fit in memory,
+# and whatever the model learns is gone at power-off.
+VOLATILE=0
+case "$(findmnt -no FSTYPE -T "$DATA" 2>/dev/null)" in
+    tmpfs|ramfs) VOLATILE=1 ;;
+    overlay) ls -d /run/live/persistence/*/ >/dev/null 2>&1 || VOLATILE=1 ;;
+esac
+
+PICK_NAME=""; PICK_BIN=""; PICK_RAM=0; PICK_WHY=""; PICK_CKPT=""
+consider() {   # name bin ram why ckpt
+    local n="$1" b="$2" r="$3" why="$4" ck="$5" need
     [ -x "$b" ] || return 0
     if [ -n "${SENTINEL_MODEL:-}" ]; then
         [ "$n" = "$SENTINEL_MODEL" ] || return 0
-        PICK_NAME="$n"; PICK_BIN="$b"; PICK_RAM="$r"; PICK_WHY="forced by SENTINEL_MODEL"; return 0
+        PICK_NAME="$n"; PICK_BIN="$b"; PICK_RAM="$r"; PICK_WHY="forced by SENTINEL_MODEL"; PICK_CKPT="$ck"
+        [ "$r" -le "$mem_mb" ] || log "warning: $n needs ~$r MB of RAM but this PC has $mem_mb MB — it will likely fail to start"
+        return 0
     fi
-    [ "$r" -le "$usable" ] || return 0
+    need="$r"; [ "$VOLATILE" = 1 ] && need=$(( r + r * 3 / 4 ))
+    [ "$need" -le "$usable" ] || return 0
     if [ -z "$PICK_NAME" ] || [ "$r" -gt "$PICK_RAM" ]; then
-        PICK_NAME="$n"; PICK_BIN="$b"; PICK_RAM="$r"; PICK_WHY="$why"
+        PICK_NAME="$n"; PICK_BIN="$b"; PICK_RAM="$r"; PICK_WHY="$why"; PICK_CKPT="$ck"
     fi
 }
 
 pick_model() {
     import_models
-    local f line n b r name bin _ckpt
+    local f line n b r ck name bin ckpt
     # trained models win over untrained ones of any size
     for f in trained-*.bin; do
         [ -f "$f" ] || continue
         line="$(build_for "$f")" || continue
-        IFS='|' read -r n b r <<<"$line"
-        consider "$n" "$b" "$r" "your trained model, fits ${mem_mb} MB RAM"
+        IFS='|' read -r n b r ck <<<"$line"
+        consider "$n" "$b" "$r" "your trained model, fits ${mem_mb} MB RAM" "$ck"
     done
     if [ -z "$PICK_NAME" ]; then
-        while IFS='|' read -r name bin _ckpt r _; do
+        while IFS='|' read -r name bin ckpt r _; do
             case "$name" in ''|'#'*) continue ;; esac
-            consider "$name" "$OPT/bin/$bin" "$r" "largest standard model that fits ${mem_mb} MB RAM"
+            consider "$name" "$OPT/bin/$bin" "$r" "largest standard model that fits ${mem_mb} MB RAM" "$ckpt"
         done < "$OPT/models.tsv"
     fi
     if [ -z "$PICK_NAME" ]; then
         PICK_NAME="slm"; PICK_BIN="$OPT/bin/sentinel-slm"; PICK_RAM=40; PICK_WHY="fallback (very low RAM)"
+        PICK_CKPT="sentinel-slm.bin"
+    fi
+    if [ "$VOLATILE" = 1 ]; then
+        log "NOTE: no persistence partition found — anything the model learns is LOST at power-off."
+        log "      Write the stick with make-usb.sh (it adds one) to keep learning between boots."
     fi
 }
 
@@ -156,8 +188,16 @@ case "$mode" in
         echo "RAM: ${mem_mb} MB  (reserving ${reserve} MB for the OS, ${usable} MB usable)"
         echo "Picked: $PICK_NAME  -> $PICK_BIN  (~${PICK_RAM} MB to train)"
         echo "Why: $PICK_WHY"
+        [ "$VOLATILE" = 1 ] && echo "Storage: RAM only (no persistence) — learning is not kept"
         ;;
-    --loop)  pick_model; log "model: $PICK_NAME ($PICK_WHY)"; exec "$PICK_BIN" ;;
+    --loop)
+        pick_model; log "model: $PICK_NAME ($PICK_WHY)"
+        # A model that already has a checkpoint goes straight to the prompt; a
+        # blank one gets a short warm-up instead of the 2000-step default.
+        if [ -z "${SLM_EPOCHS:-}" ]; then
+            if [ -e "$PICK_CKPT" ]; then export SLM_EPOCHS=0; else export SLM_EPOCHS=150; fi
+        fi
+        exec "$PICK_BIN" ;;
     --learn)
         pick_model; log "training $PICK_NAME ($PICK_WHY) — this can take a long time; Ctrl-C is safe (auto-checkpoints)"
         if [ -e corpus ]; then exec "$PICK_BIN" --train corpus; else exec "$PICK_BIN" </dev/null; fi
@@ -168,6 +208,6 @@ case "$mode" in
         ;;
     --generate|--chat) pick_model; exec "$PICK_BIN" --generate "${2:-400}" ;;
     --) shift; pick_model; exec "$PICK_BIN" "$@" ;;
-    -h|--help) sed -n '2,22p' "$0" ;;
+    -h|--help) sed -n '2,19p' "$SELF" ;;
     *) pick_model; exec "$PICK_BIN" "$@" ;;
 esac

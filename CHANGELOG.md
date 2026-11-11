@@ -19,6 +19,49 @@ GitHub Release. Format loosely follows [Keep a Changelog](https://keepachangelog
   (6.1×: 1.6× from the cache fix, 3.8× from threads).
 - Builds link with `-pthread` (Makefile, `start.sh`, the USB image).
 
+**Fixes from a full review.**
+
+*Checkpoints*
+- Saves are atomic (`.tmp` + rename) and every write is checked, so a crash or full
+  disk mid-save can't destroy the last good checkpoint.
+- A checkpoint that exists but doesn't match the build (other size, other LayerNorm
+  setting, truncated) is now **refused with a reason** instead of being treated as
+  "no checkpoint" and silently trained over.
+- Quantized exports now include the LayerNorm gains (they were dropped, so a freshly
+  loaded int8/1-bit LayerNorm model was worse than the one just trained). Old exports
+  still load. A corrupt precision field no longer crashes `--sample-quant`.
+- Unknown options, or options missing their argument, exit with an error instead of
+  falling through to default training (which rewrote the checkpoint).
+- Checkpoints from 32-bit builds load on 64-bit; `SLM_EPOCHS=0` skips the warm-up.
+- The printed loss is a bias-corrected ~100-step average (it used to lag ~1000 steps).
+- `SLM_WD` weight decay no longer pulls biases or LayerNorm gains toward zero.
+
+*Agents and web GUI*
+- GUI replies larger than 64 KB no longer read past the buffer (now truncated with a note).
+- The GUI's `/api` only answers its own page: other websites (and DNS-rebinding
+  tricks) get 403. Requests are read fully, with timeouts, so a silent client can't
+  hang the server; Ctrl-C stops it at once.
+- The per-task time cap really caps: the command runs once, in its own process group,
+  and is killed at the limit (it used to be re-run uncapped after a timeout).
+- Lookups that merely mention words like "sudo" or "pkexec" are no longer refused;
+  `TASK: sudo ...` still is.
+- Plan-only mode and refused tasks leave no temp dirs behind; the corpus walker
+  skips symlinks; the advisor's API key is no longer visible in `ps`.
+
+*USB image and scripts*
+- Trained checkpoints now actually load on the stick (the launcher misread the header).
+- Rebuilding always starts from a clean config, so a free ISO can't inherit trained
+  models from an earlier PRO build, nor a lite ISO the desktop packages.
+- Trained models are linked rather than copied (no double disk use; the shipped file
+  stays pristine), "Chat + Learn" starts at once for a trained model, and the
+  launcher warns when there is no persistence partition.
+- `make-usb.sh`: stricter system-disk detection (btrfs, live media, swap, multiple
+  mounts) and it formats only a partition it just created, after the image.
+- `build-in-docker.sh` builds on the container's disk and hands back files you own.
+- `fetch_corpus.sh` fails properly when offline; `recursive-learn.sh` keeps its
+  self-samples with a large corpus; `start.sh`/`demo.sh` build with LayerNorm unless
+  an older plain checkpoint is present; `make xl` / `make xxl` added.
+
 ## v0.6.0
 
 **LayerNorm.**

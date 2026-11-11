@@ -114,8 +114,10 @@ fetch_cves_quick() {
   echo "  fetching ${#cves[@]} famous CVE writeups"
   for c in "${cves[@]}"; do
     local id="${c##*/}"
-    curl -s --max-time 15 -o "$dest/$id.md" \
-      "https://raw.githubusercontent.com/trickest/cve/main/$c.md" 2>/dev/null
+    # -f: an HTTP error (404 page) must not be saved as if it were a writeup
+    curl -fsS --max-time 15 -o "$dest/$id.md" \
+      "https://raw.githubusercontent.com/trickest/cve/main/$c.md" 2>/dev/null \
+      || rm -f "$dest/$id.md"
   done
 }
 
@@ -136,5 +138,10 @@ if [ "${QUICK:-0}" = "1" ]; then fetch_cves_quick; else fetch_cves_sparse; fi
 echo
 echo "corpus assembled in '$OUT'  (size: $(du -sh "$OUT" 2>/dev/null | cut -f1))"
 echo "text/code files: $(find "$OUT" -type f \( -name '*.md' -o -name '*.c' -o -name '*.py' -o -name '*.h' -o -name '*.txt' \) 2>/dev/null | wc -l)"
+if [ -z "$(find "$OUT" -type f 2>/dev/null | head -1)" ]; then
+  echo "nothing was fetched (offline?) — removing the empty '$OUT' so a later run retries" >&2
+  rmdir "$OUT" 2>/dev/null || true
+  exit 1
+fi
 echo
 echo "next:  ./sentinel --train $OUT      # consolidate + train on it"

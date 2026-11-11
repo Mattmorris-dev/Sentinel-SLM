@@ -16,7 +16,7 @@
 #   ./start.sh --no-run        # set everything up but don't enter the loop
 
 set -uo pipefail
-cd "$(dirname "$0")"
+cd "$(dirname "$0")" || exit 1
 
 log() { printf '\033[36m[start]\033[0m %s\n' "$*"; }
 
@@ -42,9 +42,16 @@ if ! command -v gcc >/dev/null 2>&1; then
   echo "error: gcc not found. Install it (e.g. 'sudo apt install build-essential')." >&2
   exit 1
 fi
+# LayerNorm is the default build (as in the Makefile). A checkpoint trained by
+# an older, plain-GRU build ("SLM3" tag) keeps its matching binary instead.
+ln_flag() {
+  if [ -f "$1" ] && [ "$(od -An -tu4 -N4 "$1" 2>/dev/null | tr -d ' ')" = 1397509427 ]; then echo ""
+  else echo "-DUSE_LN"; fi
+}
 if [ ! -x ./sentinel ] || [ main.c -nt ./sentinel ]; then
   log "building ./sentinel ..."
-  gcc -O2 -Wall -o sentinel main.c -lm -pthread || { echo "build failed" >&2; exit 1; }
+  # shellcheck disable=SC2046
+  gcc -O2 -Wall $(ln_flag sentinel.bin) -o sentinel main.c -lm -pthread || { echo "build failed" >&2; exit 1; }
 else
   log "binary up to date — skipping build."
 fi

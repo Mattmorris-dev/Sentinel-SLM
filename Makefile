@@ -17,7 +17,7 @@ BIN      = sentinel
 PREFIX  ?= /usr/local
 VERSION ?= 0.6.0
 
-.PHONY: all both slm huge max ln gradcheck run train quant pet-model fetch quick-fetch clean distclean install uninstall package help
+.PHONY: all both slm huge max xl xxl ln gradcheck run train quant pet-model fetch quick-fetch clean distclean install uninstall package help
 
 all: $(BIN)            ## build the default ~50M model (plain gcc, runs anywhere)
 
@@ -44,12 +44,21 @@ max: main.c            ## push an 8 GB Pi 5 (~185M params, ~5.9 GB train)
 	$(CC) -O2 -Wall $(LNFLAG) -mcmodel=large -DHIDDEN=3200 \
 	    -DCKPT_PATH='"sentinel-max.bin"' -o sentinel-max main.c $(LDLIBS)
 
+# For machines with lots of RAM (same sizes the USB image ships as xl / xxl).
+xl: main.c             ## 16 GB machines (sentinel-xl, ~383M params, ~12.3 GB train)
+	$(CC) -O2 -Wall $(LNFLAG) -mcmodel=large -DHIDDEN=4608 \
+	    -DCKPT_PATH='"sentinel-xl.bin"' -o sentinel-xl main.c $(LDLIBS)
+
+xxl: main.c            ## 32 GB machines (sentinel-xxl, ~738M params, ~23.6 GB train)
+	$(CC) -O2 -Wall $(LNFLAG) -mcmodel=large -DHIDDEN=6400 \
+	    -DCKPT_PATH='"sentinel-xxl.bin"' -o sentinel-xxl main.c $(LDLIBS)
+
 ln: main.c             ## build with LayerNorm (sentinel-ln, faster convergence)
 	$(CC) -O2 -Wall -DUSE_LN -DHIDDEN=256 -DEMBED=64 -DNUM_LAYERS=2 \
 	    -DCKPT_PATH='"sentinel-ln.bin"' -o sentinel-ln main.c $(LDLIBS)
 
 gradcheck: main.c      ## numerically verify backprop (tiny build + --gradcheck)
-	$(CC) -O2 -Wall -DHIDDEN=16 -DEMBED=8 -DNUM_LAYERS=2 \
+	$(CC) -O2 -Wall $(LNFLAG) -DHIDDEN=16 -DEMBED=8 -DNUM_LAYERS=2 \
 	    -DCKPT_PATH='"/tmp/gc.bin"' -o sentinel-gradcheck main.c $(LDLIBS)
 	./sentinel-gradcheck --gradcheck
 
@@ -86,7 +95,9 @@ clean:                 ## remove the binary and checkpoint
 	rm -f $(BIN) sentinel.bin sentinel-int8.bin sentinel-1bit.bin \
 	    sentinel-pet-trainer sentinel-pet.bin sentinel-1bit-qat.bin \
 	    sentinel-int8-qat.bin export_model model.h \
-	    sentinel-ln sentinel-ln.bin sentinel-max sentinel-max.bin sentinel-gradcheck
+	    sentinel-ln sentinel-ln.bin sentinel-max sentinel-max.bin sentinel-gradcheck \
+	    sentinel-slm sentinel-slm.bin sentinel-huge sentinel-huge.bin \
+	    sentinel-xl sentinel-xl.bin sentinel-xxl sentinel-xxl.bin *.bin.tmp
 
 distclean: clean       ## also remove the fetched corpus
 	rm -rf corpus

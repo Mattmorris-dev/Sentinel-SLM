@@ -20,7 +20,7 @@ while [ $# -gt 0 ]; do
         --dry-run) DRY=1 ;;
         --yes) YES=1 ;;
         --force) FORCE=1 ;;
-        -h|--help) sed -n '2,13p' "$0"; exit 0 ;;
+        -h|--help) sed -n '2,11p' "$0"; exit 0 ;;
         -*) echo "make-usb: unknown option '$1'" >&2; exit 1 ;;
         *) if [ -z "$ISO" ]; then ISO="$1"; elif [ -z "$DEV" ]; then DEV="$1"; else echo "make-usb: extra argument '$1'" >&2; exit 1; fi ;;
     esac
@@ -40,20 +40,28 @@ t="$(lsblk -dno TYPE "$DEV")"
 [ -z "$CORPUS" ] || [ -d "$CORPUS" ] || die "--corpus: no such directory '$CORPUS'"
 
 # --- never touch a disk the running system uses
-while read -r name mnts; do
-    for m in $mnts; do
-        case "$m" in
-            /|/boot|/boot/*|/home|/usr|/var|"[SWAP]")
-                die "$DEV holds $m of THIS system ($name) — refusing" ;;
-        esac
-    done
-done < <(lsblk -lnpo NAME,MOUNTPOINTS "$DEV" 2>/dev/null || lsblk -lnpo NAME,MOUNTPOINT "$DEV")
-rootsrc="$(findmnt -no SOURCE / 2>/dev/null || true)"
-if [ -b "$rootsrc" ]; then
-    rootdisk="$(lsblk -no PKNAME "$rootsrc" 2>/dev/null | head -1)"
-    rootdisk="${rootdisk:+/dev/$rootdisk}"; rootdisk="${rootdisk:-$rootsrc}"
-    [ "$(readlink -f "$DEV")" != "$(readlink -f "$rootdisk")" ] || die "$DEV is the disk this system boots from — refusing"
-fi
+# whole disk that a device/partition (or dm/LUKS/LVM volume on it) lives on
+disk_of() {
+    local d p
+    d="$(readlink -f "$1")"
+    while p="$(lsblk -no PKNAME "$d" 2>/dev/null | head -1)" && [ -n "$p" ]; do d="/dev/$p"; done
+    echo "$d"
+}
+target="$(readlink -f "$DEV")"
+# Every mounted filesystem, one per line (a device mounted in several places
+# gets several lines). "[/subvol]" suffixes from btrfs are stripped.
+while read -r src mnt; do
+    src="${src%%\[*}"
+    [ -b "$src" ] || continue
+    case "$mnt" in
+        /|/boot|/boot/*|/home|/usr|/var|/run/live/medium|/run/initramfs/live|/cdrom|/lib/live/mount/medium)
+            [ "$(disk_of "$src")" != "$target" ] || die "$DEV holds $mnt of THIS running system ($src) — refusing" ;;
+    esac
+done < <(findmnt -rno SOURCE,TARGET)
+while read -r src _; do
+    [ -b "$src" ] || continue
+    [ "$(disk_of "$src")" != "$target" ] || die "$DEV holds active swap of THIS system ($src) — refusing"
+done < <(tail -n +2 /proc/swaps 2>/dev/null)
 
 # --- should look like a USB stick
 rm_flag="$(lsblk -dno RM "$DEV" | tr -d ' ')"; tran="$(lsblk -dno TRAN "$DEV" | tr -d ' ')"
@@ -82,12 +90,23 @@ if [ "$PERSIST" = 1 ]; then
     run partprobe "$DEV" || true; [ "$DRY" = 1 ] || sleep 2
     if [ "$DRY" = 1 ]; then
         echo "  [dry-run] echo ',,L' | sfdisk --append --no-reread $DEV"
-        part="${DEV}3"
+        part="<new partition on $DEV>"
     else
+        parts_before="$(lsblk -lnpo NAME,TYPE "$DEV" | awk '$2=="part"{print $1}' | sort)"
         echo ',,L' | sfdisk --append --no-reread "$DEV" >/dev/null \
             || die "couldn't add the partition automatically — the stick still boots (without persistence)"
-        partprobe "$DEV" || true; sleep 2
-        part="$(lsblk -lnpo NAME,TYPE "$DEV" | awk '$2=="part"{p=$1} END{print p}')"
+        partprobe "$DEV" || true
+        command -v udevadm >/dev/null && udevadm settle || true
+        sleep 2
+        # Format ONLY a partition that did not exist before and that starts
+        # after the image: never one of the image's own (that would wreck boot).
+        parts_after="$(lsblk -lnpo NAME,TYPE "$DEV" | awk '$2=="part"{print $1}' | sort)"
+        part="$(comm -13 <(echo "$parts_before") <(echo "$parts_after"))"
+        [ -n "$part" ] && [ "$(echo "$part" | wc -l)" = 1 ] \
+            || die "couldn't identify the new partition — the stick still boots (without persistence); nothing was formatted"
+        start_bytes=$(( $(cat "/sys/class/block/$(basename "$part")/start" 2>/dev/null || echo 0) * 512 ))
+        [ "$start_bytes" -ge "$iso_bytes" ] \
+            || die "the new partition ($part) overlaps the image — refusing to format it"
     fi
     run mkfs.ext4 -F -q -L persistence "$part"
     mnt="$(mktemp -d)"

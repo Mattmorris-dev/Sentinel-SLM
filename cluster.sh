@@ -33,6 +33,7 @@ HOSTS=(); DIRS=()
 while IFS= read -r line; do
     line="${line%%#*}"; line="$(echo "$line" | xargs)"   # strip comment + trim
     [ -z "$line" ] && continue
+    case "$line" in -*) die "bad node '$line' in '$NODES_FILE' (a host can't start with '-')" ;; esac
     case "$line" in
         *:*) HOSTS+=("${line%%:*}"); DIRS+=("${line#*:}") ;;
         *)   HOSTS+=("$line");       DIRS+=('~/sentinel') ;;
@@ -58,7 +59,7 @@ cmd_deploy() {
         h="${HOSTS[$i]}"; d="${DIRS[$i]}"
         echo "  -> $h:$d"
         ssh $SSH_OPTS "$h" "mkdir -p $d" 2>/dev/null \
-            && scp -q ./sentinel "$h:$d/sentinel" \
+            && scp -q $SSH_OPTS ./sentinel "$h:$d/sentinel" \
             && ssh $SSH_OPTS "$h" "chmod +x $d/sentinel" \
             && echo "     ok" || echo "     FAILED"
     done

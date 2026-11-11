@@ -13,6 +13,11 @@ the computer has and runs the **biggest model that fits**:
 | xl    | ~383M  | 12.3 GB      | 16 GB |
 | xxl   | ~738M  | 23.6 GB      | 32 GB |
 
+The language model is what **Chat + Learn**, training and text generation use
+(`sentinel-start --loop`, `--learn`, `--generate`). The web GUI and the terminal
+UI run the agents (tasks and corpus lookups), which don't need the model's
+weights, so they start instantly on any PC.
+
 Trained checkpoints on the stick are used before untrained ones. Older
 checkpoints still load, because the launcher reads each file's header and
 compiles a matching binary for it.

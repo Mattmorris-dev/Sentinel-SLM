@@ -66,6 +66,17 @@ int main(int argc, char **argv) {
     }
     int qmode = (int)hdr[1], V = (int)hdr[2], E = (int)hdr[3], H = (int)hdr[4], L = (int)hdr[5];
     int G = 3;
+    if ((qmode != 1 && qmode != 8) || V < 1 || V > 65536 || E < 1 || E > 8192 ||
+        H < 1 || H > 8192 || L < 1 || L > 64) {
+        fprintf(stderr, "unsupported or corrupt header (qmode=%d V=%d E=%d H=%d L=%d)\n",
+                qmode, V, E, H, L);
+        fclose(f); return 1;
+    }
+    if (hdr[6] & 2u) {   /* LayerNorm gains follow the biases; the firmware has no slot for them */
+        fprintf(stderr, "this is a LayerNorm model: the on-device firmware runs the plain GRU.\n"
+                        "Export from a non-LayerNorm build (e.g. `make pet-model`).\n");
+        fclose(f); return 1;
+    }
     size_t rbH = rowbytes(H, qmode), rbE = rowbytes(E, qmode);
 
     /* allocate flat buffers */

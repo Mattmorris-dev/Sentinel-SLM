@@ -34,7 +34,7 @@ while [ $# -gt 0 ]; do
         --corpus)      CORPUS="$2"; shift ;;
         --output)      OUT="$2"; shift ;;
         --work)        WORK="$2"; shift ;;
-        -h|--help)     sed -n '2,20p' "$0"; exit 0 ;;
+        -h|--help)     sed -n '2,18p' "$0"; exit 0 ;;
         *) echo "build-iso: unknown option '$1' (see --help)" >&2; exit 1 ;;
     esac
     shift
@@ -54,7 +54,8 @@ if [ "$STAGE_ONLY" = 0 ]; then
     [ "$(id -u)" = 0 ] || die "run as root (sudo), or use ./usb/build-in-docker.sh"
     arch="$(dpkg --print-architecture 2>/dev/null || echo unknown)"
     [ "$arch" = amd64 ] || die "build on an x86-64 machine (this is '$arch'); an image built on a Pi only boots ARM boards"
-    avail_kb="$(df -Pk "$HERE" | awk 'NR==2{print $4}')"
+    mkdir -p "$WORK"
+    avail_kb="$(df -Pk "$WORK" | awk 'NR==2{print $4}')"
     [ "$avail_kb" -gt 12000000 ] || die "need ~12 GB free disk for the build"
     say "installing build tools"
     export DEBIAN_FRONTEND=noninteractive
@@ -74,8 +75,12 @@ say "building $OS_NAME $VERSION ($EDITION$([ "$PRO" = 1 ] && echo ', PRO'))"
 # ---------------------------------------------------------------- live-build config
 mkdir -p "$WORK" "$OUT"
 cd "$WORK"
+# Start from an empty config every time. A reused one would carry the last
+# build's files into this image: trained models from a PRO build into a free
+# ISO, or the desktop's packages into a lite one.
 if [ "$STAGE_ONLY" = 0 ]; then
     lb clean --purge >/dev/null 2>&1 || true
+    rm -rf "$WORK/config"
     src_opts=()
     [ "$WITH_SOURCE" = 1 ] && src_opts=(--source true --source-images tar)
     lb config \
@@ -113,6 +118,7 @@ if [ "$LITE" = 0 ]; then
     cat > "$C/package-lists/desktop.list.chroot" <<'EOF'
 xorg xfce4 xfce4-terminal lightdm lightdm-gtk-greeter dbus-x11 polkitd
 firefox-esr network-manager-gnome thunar mousepad xdg-utils fonts-dejavu-core
+librsvg2-common adwaita-icon-theme
 EOF
 fi
 

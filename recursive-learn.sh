@@ -33,13 +33,16 @@ fi
 for r in $(seq 1 "$ROUNDS"); do
     echo "== recursive round $r/$ROUNDS =="
     # 1. generate from the current model (pure inference, no training)
-    "$BIN" --generate "$GEN_CHARS" >> "$SELF" 2>/dev/null || true
+    before=$(wc -c < "$SELF" 2>/dev/null || echo 0)
+    "$BIN" --generate "$GEN_CHARS" >> "$SELF" 2>/dev/null || echo "   ! generation failed this round" >&2
     # keep the self-corpus bounded (most recent MAXSELF bytes)
     if [ -f "$SELF" ]; then tail -c "$MAXSELF" "$SELF" > "$SELF.tmp" && mv "$SELF.tmp" "$SELF"; fi
-    echo "   generated $GEN_CHARS chars (self-corpus now $(wc -c < "$SELF") bytes)"
+    echo "   self-corpus: $before -> $(wc -c < "$SELF" 2>/dev/null || echo 0) bytes"
     # 2. retrain, anchored on the real corpus + the self-samples, then checkpoint
     if [ -n "$CORPUS" ]; then
-        SLM_EPOCHS="$EPOCHS" "$BIN" --train "$CORPUS" "$SELF" | tail -2
+        # self-samples first: --train stops reading at 64 MB, and a big corpus
+        # listed first would crowd them out entirely
+        SLM_EPOCHS="$EPOCHS" "$BIN" --train "$SELF" "$CORPUS" | tail -2
     else
         SLM_EPOCHS="$EPOCHS" "$BIN" --train "$SELF" | tail -2
     fi
