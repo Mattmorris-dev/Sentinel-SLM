@@ -24,3 +24,14 @@ self-corpus.txt.tmp
 
 # USB image build output
 usb/build/
+
+# Local builds and training logs
+sentinel-slm
+sentinel-huge
+sentinel-max
+sentinel-xl
+sentinel-xxl
+sentinel-ln
+sentinel-gradcheck
+*.bin.tmp
+train.log
